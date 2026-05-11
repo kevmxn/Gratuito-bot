@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 """
 Multi-Roulette Session Bot — 5 Ruletas / Sesiones de 30 min / 48 señales/día
@@ -51,7 +49,8 @@ for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN   = "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw"
-CHAT_ID = -1003835197023
+CHAT_ID        = -1003835197023
+STATS_THREAD_ID = 40034   # Tema del grupo donde se envían las estadísticas diarias
 
 _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
@@ -114,6 +113,12 @@ def _tg_call(fn, *a, **kw):
 
 def tg_send(text: str) -> Optional[int]:
     msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
+    return msg.message_id if msg else None
+
+def tg_send_stats(text: str) -> Optional[int]:
+    """Envía al tema (topic) 40034 del grupo — exclusivo para el reporte diario de stats."""
+    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
+                   parse_mode="HTML", message_thread_id=STATS_THREAD_ID)
     return msg.message_id if msg else None
 
 def tg_delete(chat_id: int, message_id: int):
@@ -350,6 +355,9 @@ class RouletteEngine:
     def _update_state(self, number: int, persist=True, train_model=True):
         color = REAL_COLOR_MAP.get(number, "VERDE")
         d = get_dozen(number); c = get_column(number)
+        spin_num = len(self.spin_history) + 1
+        if persist:
+            logger.info(f"[{self.name}] 🎰 #{spin_num} → {number} {color} D{d} C{c}")
         if number != 0 and self.spin_history:
             prev = self.spin_history[-1]["number"]
             if prev != 0:
@@ -549,11 +557,13 @@ class RouletteEngine:
         self.oportunidad = 1
         self.active_signal_msg_id = None
 
-    def feed_number(self, number: int):
+    def feed_number(self, number: int, active: bool = False):
         """Alimentar número al estado del engine (sin lógica de señal — solo datos)."""
         self._update_state(number)
+        tag = "ACTIVA" if active else "pasiva"
         if not self.warmup_done:
             self.ws_count += 1
+            logger.info(f"[{self.name}] ⏳ Warmup {self.ws_count}/{WARMUP_SPINS} [{tag}]")
             if self.ws_count >= WARMUP_SPINS:
                 self.warmup_done = True
                 logger.info(f"[{self.name}] ✅ WARMUP completado")
@@ -607,7 +617,7 @@ class SessionManager:
     # ── Tick de sesión (llamado por cada número recibido en la ruleta activa) ─
     def tick_active(self, engine: RouletteEngine, number: int):
         """Procesa número para la ruleta activa en sesión."""
-        engine.feed_number(number)
+        engine.feed_number(number, active=True)
 
         # Verificar timeout de sesión
         elapsed = time.time() - self.session_start
@@ -640,7 +650,7 @@ class SessionManager:
 
     # ── Tick pasivo (ruletas no activas — solo acumular datos) ────────────────
     def tick_passive(self, engine: RouletteEngine, number: int):
-        engine.feed_number(number)
+        engine.feed_number(number, active=False)
 
     # ── Verificar timeout periódico (sin números entrantes) ───────────────────
     async def session_watchdog(self):
@@ -762,11 +772,11 @@ async def daily_stats_loop():
         wait_secs = (target - now_arg).total_seconds()
         logger.info(f"[Stats] Próximo reporte diario en {wait_secs/3600:.1f}h")
         await asyncio.sleep(wait_secs)
-        # Enviar stats unificadas
+        # Enviar stats unificadas al tema 40034
         if session_mgr_global:
             total_balance = sum(e.bankroll for e in session_mgr_global.engines)
-            tg_send(GLOBAL_STATS.get_stats_text(total_balance))
-            logger.info("[Stats] Reporte diario enviado.")
+            tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
+            logger.info("[Stats] Reporte diario enviado al tema 40034.")
 
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
@@ -800,7 +810,7 @@ def cmd_status(m):
 def cmd_stats(m):
     if not session_mgr_global: return
     total_balance = sum(e.bankroll for e in session_mgr_global.engines)
-    bot.reply_to(m, GLOBAL_STATS.get_stats_text(total_balance), parse_mode="HTML")
+    tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
 
 @bot.message_handler(commands=['siguiente'])
 def cmd_siguiente(m):
