@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-Russian Roulette — Bot de señales para Docenas y Columnas
+Speed Roulette 2 — Bot de señales para Docenas y Columnas
 Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
 
   - Capital inicial: 0
   - Apuesta base: 0.50 por docena/columna
   - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
       · Gale #0 → apuesta = nivel × BASE_BET
-      · Gale #1 → apuesta = déficit hasta objetivo + BASE_BET
-  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel. Usa ficha base del nivel.
+      · Gale #1 → apuesta = 3 × (nivel × BASE_BET)  [Gestión conservadora x3]
+  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel.
   - EMPATE (cero): termina la señal, sin cambio de bankroll.
-  - Pre-entrenamiento: tabla russian_roulette (russian-azure.db)
-  - WS Key: 221
+  - Sin base de datos de pre-entrenamiento (solo datos nuevos).
+  - WS Key: 205
 """
 
 import asyncio
@@ -19,7 +19,6 @@ import json
 import logging
 import math
 import os
-import re
 import sqlite3
 import threading
 import time
@@ -39,12 +38,12 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [RussianDC] %(levelname)s %(message)s')
-logger = logging.getLogger("RussianDC")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [Speed2DC] %(levelname)s %(message)s')
+logger = logging.getLogger("Speed2DC")
 for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
-# ─── TELEGRAM — RUSSIAN ROULETTE ──────────────────────────────────────────────
+# ─── TELEGRAM — SPEED ROULETTE 2 ─────────────────────────────────────────────
 TOKEN   = "8714149875:AAFJugWY0E5A4C0lrxn2bMcKsQEieqo_t5M"
 CHAT_ID = -1003630680656
 
@@ -59,10 +58,8 @@ bot.session = _session
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL      = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID   = "ppcjd00000007254"
-WS_KEY      = 221
-LIVE_DB     = "russian_live.db"
-AZURE_DB    = "russian-azure.db"
-AZURE_TABLE = "russian_roulette"
+WS_KEY      = 205
+LIVE_DB     = "speed2_live.db"
 
 BASE_BET       = 0.50
 MAX_NIVEL      = 6
@@ -226,7 +223,7 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── GESTOR DOCENAS (CON GESTIÓN DE DEUDAS INTERNA) ──────────────────────────
+# ─── GESTOR DOCENAS (GESTIÓN X3 CONSERVADORA) ────────────────────────────────
 class GestorDocenas:
     def __init__(self):
         self.nivel = 1
@@ -248,12 +245,7 @@ class GestorDocenas:
         if self.oportunidad == 1:
             return self.nivel * BASE_BET
         else:
-            target = self.get_target()
-            deficit = target - balance_actual
-            if deficit <= 0:
-                return BASE_BET
-            apuesta = max(BASE_BET, math.ceil(deficit / BASE_BET) * BASE_BET)
-            return apuesta
+            return 3 * self.nivel * BASE_BET
 
     def registrar_perdida_senal(self):
         self.debt_stack.append(self.b0)
@@ -261,7 +253,7 @@ class GestorDocenas:
             self.nivel += 1
         else:
             self.nivel = 1
-        logger.info(f"[RussianDC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
+        logger.info(f"[Speed2DC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
 
     def verificar_recuperacion(self, balance_actual: float):
         while self.debt_stack:
@@ -301,7 +293,6 @@ class DetailedStats:
 
     def get_stats_text(self, bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
-        # Los empates (zeros) cuentan como aciertos para la Assertividade
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DE SEÑALES 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
@@ -322,7 +313,7 @@ class DetailedStats:
         return text
 
 # ─── ENGINE ───────────────────────────────────────────────────────────────────
-class RussianRouletteEngine:
+class Speed2RouletteEngine:
     def __init__(self):
         self.spin_history: list = []
         self.dozen_seq: list = []; self.column_seq: list = []
@@ -348,26 +339,10 @@ class RussianRouletteEngine:
         self.active_signal_msg_id = None
 
         live_loaded  = self._load_live_history()
-        azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
-        total = live_loaded + azure_loaded
+        total = live_loaded
         self.ws_count = total
         self.warmup_done = total >= WARMUP_SPINS
-        logger.info(f"[RussianDC] 📦 Pre-cargados: {total} (Live:{live_loaded} + DB:{azure_loaded}) | Warmup: {'✅' if self.warmup_done else '⏳'}")
-
-    def _pretrain_from_db(self, db_path: str, table_name: str) -> int:
-        if not os.path.exists(db_path): return 0
-        spins = []
-        try:
-            pattern = re.compile(rf'INSERT INTO "{table_name}" VALUES \(\d+,(\d+),')
-            with open(db_path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    m = pattern.search(line)
-                    if m: spins.append(int(m.group(1)))
-        except: return 0
-        for n in spins: self._update_state(n, persist=False, train_model=False)
-        self._train_models()
-        logger.info(f"[RussianDC] ✅ Pre-entrenado con {len(spins)} giros de '{table_name}'")
-        return len(spins)
+        logger.info(f"[Speed2DC] 📦 Pre-cargados: {total} (Live) | Warmup: {'✅' if self.warmup_done else '⏳'}")
 
     def _load_live_history(self) -> int:
         try: rows = self._db.execute("SELECT number FROM live_spins ORDER BY id ASC").fetchall()
@@ -414,7 +389,7 @@ class RussianRouletteEngine:
             self.spins_since_train += 1
             if self.spins_since_train >= TRAIN_INTERVAL:
                 self._train_models(); self.spins_since_train = 0
-                logger.info("[RussianDC] 🧠 Modelos re-entrenados (c/100 giros)")
+                logger.info("[Speed2DC] 🧠 Modelos re-entrenados (c/100 giros)")
         if persist: self._persist(number)
 
     def _get_pf(self, cat_type: str) -> Optional[Dict]:
@@ -471,14 +446,14 @@ class RussianRouletteEngine:
             base = 0.65 * pf_d["prob"] + 0.35 * ph_d["prob"]
             ml   = self._predict_pair_ml("DOCENA", pf_d["missing"])
             prob = 0.5 * base + 0.5 * ml
-            logger.info(f"[RussianDC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            logger.info(f"[Speed2DC] D base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"DOCENA","pair":tuple(f"D{x}" for x in sorted(pf_d["pair"])),"missing":f"D{pf_d['missing']}","prob":prob})
         if pf_c and ph_c and set(pf_c["pair"]) == set(ph_c["pair"]):
             base = 0.65 * pf_c["prob"] + 0.35 * ph_c["prob"]
             ml   = self._predict_pair_ml("COLUMNA", pf_c["missing"])
             prob = 0.5 * base + 0.5 * ml
-            logger.info(f"[RussianDC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
+            logger.info(f"[Speed2DC] C base:{base:.0%} ml:{ml:.0%} final:{prob:.0%}")
             if prob >= MIN_PROB:
                 candidates.append({"type":"COLUMNA","pair":tuple(f"C{x}" for x in sorted(pf_c["pair"])),"missing":f"C{pf_c['missing']}","prob":prob})
         return max(candidates, key=lambda x: x["prob"]) if candidates else None
@@ -488,8 +463,8 @@ class RussianRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
-                f"🕹️ Roulette Russian\n"
+        return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
+                f"🕹️ Roulette Speed 2\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
                 f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
@@ -574,14 +549,14 @@ class RussianRouletteEngine:
     def _process_inner(self, number: int):
         color = REAL_COLOR_MAP.get(number, "VERDE")
         d = get_dozen(number); c = get_column(number)
-        logger.info(f"[RussianDC] 🎰 #{len(self.spin_history)+1}: {number} {color} D{d} C{c}")
+        logger.info(f"[Speed2DC] 🎰 #{len(self.spin_history)+1}: {number} {color} D{d} C{c}")
         self._update_state(number)
         if not self.warmup_done:
             self.ws_count += 1
             if self.ws_count < WARMUP_SPINS: return
             self.warmup_done = True
-            tg_send("🟢 <b>Russian Roulette DC</b> — Sistema PF+PH+ML Listo.")
-            logger.info("[RussianDC] ✅ WARMUP COMPLETADO")
+            tg_send("🟢 <b>Speed Roulette 2 DC</b> — Sistema PF+PH+ML Listo.")
+            logger.info("[Speed2DC] ✅ WARMUP COMPLETADO")
         if self.signal_active:
             self._resolve(number, color)
         else:
@@ -592,7 +567,7 @@ class RussianRouletteEngine:
                 self.gestor.iniciar_senal(self.bankroll)
                 self.total_signal_loss = 0.0
                 self._send_signal()
-                logger.info(f"[RussianDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
+                logger.info(f"[Speed2DC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
     async def run_ws(self):
         reconnect_delay = 5
@@ -600,7 +575,7 @@ class RussianRouletteEngine:
             try:
                 async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "key": WS_KEY, "casinoId": CASINO_ID}))
-                    logger.info(f"[RussianDC] ✅ WS conectado — Russian Roulette key={WS_KEY}")
+                    logger.info(f"[Speed2DC] ✅ WS conectado — Speed Roulette 2 key={WS_KEY}")
                     reconnect_delay = 5
                     async for raw in ws:
                         try: data = json.loads(raw)
@@ -624,16 +599,16 @@ class RussianRouletteEngine:
                                 except: pass
                                 break
             except Exception as e:
-                logger.warning(f"[RussianDC] WS desconectado: {e}. Recon en {reconnect_delay}s")
+                logger.warning(f"[Speed2DC] WS desconectado: {e}. Recon en {reconnect_delay}s")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, 60)
 
 # ─── FLASK ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-engine: Optional[RussianRouletteEngine] = None
+engine: Optional[Speed2RouletteEngine] = None
 
 @app.route("/")
-def home(): return jsonify({"status": "ok", "bot": "Russian DC", "key": WS_KEY})
+def home(): return jsonify({"status": "ok", "bot": "Speed 2 DC", "key": WS_KEY})
 @app.route("/ping")
 def ping(): return jsonify({"status": "pong", "ts": time.time()})
 @app.route("/health")
@@ -649,7 +624,7 @@ async def self_ping_loop():
         await asyncio.sleep(240)
 
 @bot.message_handler(commands=['start', 'help'])
-def cmd_start(m): bot.reply_to(m, "<b>🎰 Russian Roulette DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 221\n\n/status /stats /reset", parse_mode="HTML")
+def cmd_start(m): bot.reply_to(m, "<b>🎰 Speed Roulette 2 DC</b>\n\nApuesta: 0.50 por D/C\nCapital: 0\nKey WS: 205\n\n/status /stats /reset", parse_mode="HTML")
 
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
@@ -668,13 +643,13 @@ def cmd_reset(m):
     bot.reply_to(m, "🔄 <b>Resetado — Balance: 0.00</b>", parse_mode="HTML")
 
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)), debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10003)), debug=False, use_reloader=False)
 
 async def main():
     global engine
-    engine = RussianRouletteEngine()
+    engine = Speed2RouletteEngine()
     threading.Thread(target=lambda: bot.polling(none_stop=True, interval=1, timeout=30), daemon=True).start()
-    logger.info("[RussianDC] 🎰 Bot Russian iniciado — key=221")
+    logger.info("[Speed2DC] 🎰 Bot Speed 2 iniciado — key=205")
     await asyncio.gather(asyncio.create_task(engine.run_ws()), asyncio.create_task(self_ping_loop()))
 
 if __name__ == "__main__":
