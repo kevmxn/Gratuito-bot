@@ -355,9 +355,6 @@ class RouletteEngine:
     def _update_state(self, number: int, persist=True, train_model=True):
         color = REAL_COLOR_MAP.get(number, "VERDE")
         d = get_dozen(number); c = get_column(number)
-        spin_num = len(self.spin_history) + 1
-        if persist:
-            logger.info(f"[{self.name}] 🎰 #{spin_num} → {number} {color} D{d} C{c}")
         if number != 0 and self.spin_history:
             prev = self.spin_history[-1]["number"]
             if prev != 0:
@@ -558,15 +555,28 @@ class RouletteEngine:
         self.active_signal_msg_id = None
 
     def feed_number(self, number: int, active: bool = False):
-        """Alimentar número al estado del engine (sin lógica de señal — solo datos)."""
-        self._update_state(number)
-        tag = "ACTIVA" if active else "pasiva"
+        """Alimentar número al estado del engine. Persiste en DB y loguea en consola."""
+        color  = REAL_COLOR_MAP.get(number, "VERDE")
+        d      = get_dozen(number)
+        c      = get_column(number)
+        tag    = "🟢 ACTIVA" if active else "⚫ pasiva"
+        spin_n = len(self.spin_history) + 1  # antes del update
+
+        self._update_state(number)           # persiste en DB aquí
+
         if not self.warmup_done:
             self.ws_count += 1
-            logger.info(f"[{self.name}] ⏳ Warmup {self.ws_count}/{WARMUP_SPINS} [{tag}]")
+            warmup_tag = f"⏳ warmup {self.ws_count}/{WARMUP_SPINS}"
             if self.ws_count >= WARMUP_SPINS:
                 self.warmup_done = True
-                logger.info(f"[{self.name}] ✅ WARMUP completado")
+                warmup_tag = "✅ WARMUP listo"
+        else:
+            warmup_tag = "✔"
+
+        logger.info(
+            f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {color:<5} D{d} C{c} "
+            f"| {tag} | {warmup_tag} | 💾 guardado"
+        )
 
 
 # ─── GESTOR DE SESIONES ───────────────────────────────────────────────────────
