@@ -7,9 +7,9 @@ Sistema PF + PH + ML Cruzado + Gestión Docenas (6 niveles, 2 oportunidades)
   - Apuesta base: 0.50 por docena/columna
   - Gestión: 6 niveles con 2 oportunidades (Gale #0 y Gale #1) por señal.
       · Gale #0 → apuesta = nivel × BASE_BET
-      · Gale #1 → apuesta = déficit hasta B0 + BASE_BET
+      · Gale #1 → apuesta = déficit hasta objetivo + BASE_BET
+  - Si se pierde Gale #1: registra deuda (B0) y sube de nivel. Usa ficha base del nivel.
   - EMPATE (cero): termina la señal, sin cambio de bankroll.
-  - Si se pierde Gale #1, sube de nivel y ESPERA nueva señal.
   - Pre-entrenamiento: tabla russian_roulette (russian-azure.db)
   - WS Key: 221
 """
@@ -62,10 +62,10 @@ CASINO_ID   = "ppcjd00000007254"
 WS_KEY      = 221
 LIVE_DB     = "russian_live.db"
 AZURE_DB    = "russian-azure.db"
-AZURE_TABLE = "russian_roulette"       # 15.847 giros
+AZURE_TABLE = "russian_roulette"
 
-BASE_BET       = 0.50    # Apuesta base por docena/columna
-MAX_NIVEL      = 6       # Máximo 6 niveles de recuperación
+BASE_BET       = 0.50
+MAX_NIVEL      = 6
 WARMUP_SPINS   = 25
 MIN_PROB       = 0.78
 TRAIN_INTERVAL = 100
@@ -115,6 +115,12 @@ def _tg_call(fn, *a, **kw):
 def tg_send(text: str) -> Optional[int]:
     msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
     return msg.message_id if msg else None
+
+def tg_delete(chat_id: int, message_id: int):
+    try:
+        _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
+    except:
+        pass
 
 # ─── EMA ──────────────────────────────────────────────────────────────────────
 def calc_ema(data: list, period: int) -> list:
@@ -220,38 +226,52 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── GESTOR DOCENAS (NUEVA GESTIÓN) ──────────────────────────────────────────
+# ─── GESTOR DOCENAS (CON GESTIÓN DE DEUDAS INTERNA) ──────────────────────────
 class GestorDocenas:
-    """
-    Gestor de apuestas a 2 docenas/columnas (pago 1.50x)
-    con recuperación progresiva en 6 niveles.
-    Cada señal tiene 2 oportunidades (Gale #0 y Gale #1).
-    """
     def __init__(self):
-        self.b0 = 0.0
         self.nivel = 1
-        self.oportunidad = 1  # 1 = Gale #0, 2 = Gale #1
+        self.oportunidad = 1
         self.max_nivel = MAX_NIVEL
-        self.objetivo = 0.0
+        self.b0 = 0.0
+        self.debt_stack: list[float] = []
 
     def iniciar_senal(self, balance_actual: float):
-        """Registra el balance actual como B0 y reinicia oportunidad a 1."""
         self.b0 = balance_actual
-        self.objetivo = self.b0 + BASE_BET
         self.oportunidad = 1
 
-    def apostar_por_docena(self, balance_actual: float) -> float:
-        """Devuelve la cantidad a apostar en CADA docena según la oportunidad."""
-        if balance_actual >= self.objetivo:
-            self.iniciar_senal(balance_actual)
-            return BASE_BET
+    def get_target(self) -> float:
+        if self.debt_stack:
+            return self.debt_stack[-1] + BASE_BET
+        return self.b0 + BASE_BET
 
+    def apostar_por_docena(self, balance_actual: float) -> float:
         if self.oportunidad == 1:
             return self.nivel * BASE_BET
         else:
-            deficit = self.objetivo - balance_actual
+            target = self.get_target()
+            deficit = target - balance_actual
+            if deficit <= 0:
+                return BASE_BET
             apuesta = max(BASE_BET, math.ceil(deficit / BASE_BET) * BASE_BET)
             return apuesta
+
+    def registrar_perdida_senal(self):
+        self.debt_stack.append(self.b0)
+        if self.nivel < self.max_nivel:
+            self.nivel += 1
+        else:
+            self.nivel = 1
+        logger.info(f"[RussianDC] 📋 Deuda registrada: B0={self.b0:.2f} | Pila: {len(self.debt_stack)} deudas | Nivel→{self.nivel}")
+
+    def verificar_recuperacion(self, balance_actual: float):
+        while self.debt_stack:
+            target = self.debt_stack[-1] + BASE_BET
+            if balance_actual >= target:
+                self.debt_stack.pop()
+            else:
+                break
+        if not self.debt_stack:
+            self.nivel = 1
 
 # ─── STATS ────────────────────────────────────────────────────────────────────
 class DetailedStats:
@@ -281,7 +301,8 @@ class DetailedStats:
 
     def get_stats_text(self, bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
-        eff = (self.wins / total * 100) if total > 0 else 0.0
+        # Los empates (zeros) cuentan como aciertos para la Assertividade
+        eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DE SEÑALES 📊\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
@@ -317,13 +338,14 @@ class RussianRouletteEngine:
         self.signal_active = False; self.active_type = None
         self.active_pair: tuple = (); self.active_missing = ""
         self.gestor = GestorDocenas()
-        self.total_signal_loss = 0.0  # Acumulador de pérdida en la señal actual
-        self.bankroll: float = 0.0          # ← Capital inicial 0
+        self.total_signal_loss = 0.0
+        self.bankroll: float = 0.0
         self.trigger_number = 0; self.trigger_color = ""
         self.stats = DetailedStats()
         self._db = _get_db()
         self.spins_since_train = 0
         self.last_game_id = None
+        self.active_signal_msg_id = None
 
         live_loaded  = self._load_live_history()
         azure_loaded = self._pretrain_from_db(AZURE_DB, AZURE_TABLE)
@@ -466,22 +488,24 @@ class RussianRouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        return (f"🎰 ENTRADA CONFIRMADA 🎰\n\n"
-                f"🎮 Roulette Russian\n"
+        return (f"✅ ENTRADA CONFIRMADA ✅\n\n"
+                f"🕹️ Roulette Russian\n"
                 f"🎯 Entrar en las {type_str}: {pair_disp}\n"
                 f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💸 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
+                f"💵 Apuesta total: {bet * 2:.2f} (por {singular}: {bet:.2f})\n"
                 f"⚔️ Cubrir el CERO 🟢\n"
                 f"🛟 Max: 1 Gales")
 
     def _send_signal(self):
-        tg_send(self._build_signal_text())
+        msg_id = tg_send(self._build_signal_text())
+        if msg_id:
+            self.active_signal_msg_id = msg_id
 
     def _resolve(self, number: int, color: str):
         d, c = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        gale_num = self.gestor.oportunidad - 1  # 0 para Gale #0, 1 para Gale #1
+        gale_num = self.gestor.oportunidad - 1
 
         bet = self.gestor.apostar_por_docena(self.bankroll)
 
@@ -499,53 +523,44 @@ class RussianRouletteEngine:
         if won:
             profit = bet
             self.bankroll = round(self.bankroll + profit, 2)
+            self.gestor.verificar_recuperacion(self.bankroll)
+
             tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{gale_num}\n"
                     f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
                     f"💰 Balance actual: {self.bankroll:.2f}")
-            
+
             self.stats.record('WIN', gale_num, number, val_num, type_str, self.bankroll)
-            
-            # Si se alcanza el objetivo global (B0 + BASE_BET), se resetea el nivel de recuperación
-            if self.bankroll >= self.gestor.objetivo:
-                self.gestor.nivel = 1
-                
             self._check_stats()
-            self._reset_signal()  # Termina la señal, espera nueva detección
+            self._reset_signal()
         else:
             loss = bet * 2
             self.bankroll = round(self.bankroll - loss, 2)
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
-            if gale_num == 0:  # Perdió Gale #0
-                tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #0\n"
-                        f"🚨 Para la próxima ganaremos -{loss:.2f} 🚨\n"
-                        f"💰 Balance actual: {self.bankroll:.2f}")
+            if gale_num == 0:
+                if self.active_signal_msg_id:
+                    tg_delete(CHAT_ID, self.active_signal_msg_id)
+                    self.active_signal_msg_id = None
                 
-                # Pasar a Gale #1 y enviar la señal nueva actualizada
                 self.gestor.oportunidad = 2
                 self._send_signal()
-            else:  # Perdió Gale #1
+            else:
                 tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #1\n"
                         f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
                         f"💰 Balance actual: {self.bankroll:.2f}")
-                
-                # LOSS solo se cuenta en estadísticas en el intento 2 (Gale #1)
-                self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll) 
-                
-                # Subir de nivel para la próxima señal
-                if self.gestor.nivel < MAX_NIVEL:
-                    self.gestor.nivel += 1
-                else:
-                    self.gestor.nivel = 1  # Si llega al máximo, vuelve a 1
-                    
+
+                self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll)
+                self.gestor.registrar_perdida_senal()
+
                 self._check_stats()
-                self._reset_signal()  # Termina la señal, espera nueva detección
+                self._reset_signal()
 
     def _reset_signal(self):
         self.signal_active = False
         self.active_pair = ()
         self.active_type = None
-        self.total_signal_loss = 0.0  # Resetea el acumulador de pérdida de la señal
+        self.total_signal_loss = 0.0
+        self.active_signal_msg_id = None
 
     def _check_stats(self):
         if not self.stats.should_send(): return
@@ -575,7 +590,7 @@ class RussianRouletteEngine:
                 self.signal_active = True; self.active_type = sig["type"]
                 self.active_pair = sig["pair"]; self.active_missing = sig["missing"]
                 self.gestor.iniciar_senal(self.bankroll)
-                self.total_signal_loss = 0.0  # Inicia acumulador en 0
+                self.total_signal_loss = 0.0
                 self._send_signal()
                 logger.info(f"[RussianDC] 🎯 SEÑAL {sig['type']}: {sig['pair']} ({sig['prob']:.0%})")
 
@@ -649,7 +664,7 @@ def cmd_stats(m):
 
 @bot.message_handler(commands=['reset'])
 def cmd_reset(m):
-    if engine: engine.stats = DetailedStats(); engine.bankroll = 0.0; engine.gestor.nivel = 1
+    if engine: engine.stats = DetailedStats(); engine.bankroll = 0.0; engine.gestor.nivel = 1; engine.gestor.debt_stack = []
     bot.reply_to(m, "🔄 <b>Resetado — Balance: 0.00</b>", parse_mode="HTML")
 
 def run_flask():
