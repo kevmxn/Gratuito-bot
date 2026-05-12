@@ -68,11 +68,11 @@ bot.session = _session
 
 # ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 223, "name": "ROULETTE ITALIA"},
-    {"key": 222, "name": "ROULETTE DEUTSCHE"},
+    {"key": 223, "name": "ROULETTE ITALIA TRICOLORE"},
+    {"key": 222, "name": "ROULETTE DEUTSCHE (ALEMANA)"},
     {"key": 203, "name": "SPEED ROULETTE 1"},
     {"key": 205, "name": "SPEED ROULETTE 2"},
-    {"key": 227, "name": "ROULETTE 1"},
+    {"key": 227, "name": "ROULETTE 1 (AZURE)"},
     {"key": 204, "name": "MEGA ROULETTE"},
     {"key": 206, "name": "ROULETTE MACAO"},
 ]
@@ -522,16 +522,11 @@ class RouletteEngine:
 
         # ── CERO ──────────────────────────────────────────────────────────────
         if number == 0:
-            result_text = (
+            tg_send(
                 f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
-                f"🉑 Para la próxima ganaremos {self.bankroll:.2f} 🉑\n"
+                f"🉑 Para la próxima ganaremos 0.00 🉑\n"
                 f"💰 Balance actual: {self.bankroll:.2f}"
             )
-            if self.active_signal_msg_id:
-                tg_edit(CHAT_ID, self.active_signal_msg_id,
-                        self._build_signal_text() + f"\n\n{result_text}")
-            else:
-                tg_send(result_text)
             GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, self.bankroll)
             self._reset_signal()
             return True
@@ -543,16 +538,11 @@ class RouletteEngine:
             profit = bet
             self.bankroll = round(self.bankroll + profit, 2)
             cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-            result_text = (
+            tg_send(
                 f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
                 f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
                 f"💰 Balance actual: {self.bankroll:.2f}"
             )
-            if self.active_signal_msg_id:
-                tg_edit(CHAT_ID, self.active_signal_msg_id,
-                        self._build_signal_text() + f"\n\n{result_text}")
-            else:
-                tg_send(result_text)
             GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, self.bankroll)
             self._reset_signal()
             return True
@@ -563,28 +553,23 @@ class RouletteEngine:
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
             if intento == 1:
-                # ── Perdió 1° intento → borrar mensaje, enviar 2° oportunidad ──
+                # ── Perdió 1° intento → borrar mensaje de señal, enviar GALE #1 ──
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
                 self.oportunidad    = 2
-                self.skip_next_spin = True   # ignorar el giro actual, verificar desde el siguiente
-                self.send_signal()           # nuevo mensaje con GALE #1
-                return False                 # señal sigue activa
+                self.skip_next_spin = True
+                self.send_signal()   # nuevo mensaje con GALE #1
+                return False         # señal sigue activa
 
             else:
-                # ── Perdió 2° intento (gale) → editar mensaje con LOSS ──────
+                # ── Perdió 2° intento (gale) → mensaje nuevo con LOSS ──────
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-                result_text = (
+                tg_send(
                     f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
                     f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
                     f"💰 Balance actual: {self.bankroll:.2f}"
                 )
-                if self.active_signal_msg_id:
-                    tg_edit(CHAT_ID, self.active_signal_msg_id,
-                            self._build_signal_text() + f"\n\n{result_text}")
-                else:
-                    tg_send(result_text)
                 GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, self.bankroll)
                 self._reset_signal()
                 return True
