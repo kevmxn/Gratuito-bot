@@ -729,17 +729,51 @@ class SessionManager:
         await asyncio.sleep(wait)
         self._start_session()
 
+        # Timestamp en que el watchdog detectó que la sesión debía terminar
+        # pero había una señal activa. None = no estamos en espera.
+        _waiting_signal_since: Optional[float] = None
+        # Máximo tiempo extra que esperamos a que la señal se resuelva (2 spins = ~60s).
+        SIGNAL_WAIT_TIMEOUT = 120  # segundos
+
         while True:
             await asyncio.sleep(1)
-            elapsed = time.time() - self.session_start
+            now     = time.time()
+            elapsed = now - self.session_start
             engine  = self.engines[self.current_idx]
 
             if self.session_active:
                 if elapsed >= SESSION_ACTIVE:
                     if engine.signal_active:
-                        continue
+                        # Registrar cuándo empezamos a esperar
+                        if _waiting_signal_since is None:
+                            _waiting_signal_since = now
+                            logger.info(
+                                f"[SessionManager] ⏳ Sesión terminada pero señal activa en "
+                                f"{engine.name} — esperando resolución (máx {SIGNAL_WAIT_TIMEOUT}s)..."
+                            )
+                        # Si se superó el timeout, cancelar la señal forzosamente
+                        elif now - _waiting_signal_since >= SIGNAL_WAIT_TIMEOUT:
+                            logger.warning(
+                                f"[SessionManager] ⚠️ Timeout esperando señal en {engine.name} "
+                                f"({SIGNAL_WAIT_TIMEOUT}s). Cancelando señal y cerrando sesión."
+                            )
+                            if engine.active_signal_msg_id:
+                                tg_edit(CHAT_ID, engine.active_signal_msg_id,
+                                        engine._build_signal_text() +
+                                        "\n\n⚠️ Señal cancelada — tiempo de sesión agotado.")
+                            engine._reset_signal()
+                            _waiting_signal_since = None
+                            # Caer al cierre normal abajo
+                        else:
+                            continue  # Seguir esperando
+                    else:
+                        _waiting_signal_since = None  # señal resuelta, reset
+
+                    # Cerrar sesión
+                    end_time = time.time()
                     self._end_session()
-                    pause_remaining = SESSION_TOTAL - elapsed
+                    # Calcular pausa restante desde el inicio del slot actual
+                    pause_remaining = SESSION_TOTAL - (end_time - self.session_start)
                     if pause_remaining > 0:
                         logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
                         await asyncio.sleep(pause_remaining)
