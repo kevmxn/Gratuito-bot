@@ -77,6 +77,46 @@ ROULETTES = [
     {"key": 206, "name": "ROULETTE MACAO"},
 ]
 
+# ─── LINKS POR RULETA ─────────────────────────────────────────────────────────
+ROULETTE_LINKS = {
+    "MEGA ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:megaroulette",
+    "AUTO ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
+    "ROULETTE ITALIA":        "https://1win.lat/casino/play/v_pragmatic:rouletteitaliatricolore",
+    "ROULETTE 1":             "https://1win.lat/casino/play/v_pragmatic:roulette1",
+    "ROULETTE 2 EXTRA TIME":  "https://1win.lat/casino/play/v_pragmatic:roulette2",
+    "SPEED ROULETTE 1":       "https://1win.lat/casino/play/v_pragmatic:speedroulette1",
+    "SPEED ROULETTE 2":       "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
+    "ROULETTE MACAO":         "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
+    "ROULETTE LATINA":        "https://1win.lat/casino/play/v_pragmatic:1winspanishroulette",
+    "ROULETTE DEUTSCHE":      "https://1win.lat/casino/play/v_pragmatic:germanroulette",
+    "ROULETTE TURKISH":       "https://1win.lat/casino/play/v_pragmatic:1winturkishroulette",
+    "ROULETTE RUSSIAN":       "https://1win.lat/casino/play/v_pragmatic:1winroulette",
+}
+
+def get_roulette_url(name: str) -> Optional[str]:
+    """Devuelve el link de la ruleta ignorando emojis y variaciones de nombre."""
+    # Buscar coincidencia exacta primero
+    if name in ROULETTE_LINKS:
+        return ROULETTE_LINKS[name]
+    # Buscar por nombre base (sin emoji)
+    name_upper = name.upper()
+    for key, url in ROULETTE_LINKS.items():
+        if key.upper() in name_upper or name_upper in key.upper():
+            return url
+    return None
+
+def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
+    """Envía mensaje con botón inline de acceso a la ruleta (sin pie de página del link)."""
+    url = get_roulette_url(roulette_name)
+    if not url:
+        return tg_send(text)
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton("🎰 ACCEDER A LA RULETA", url=url))
+    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
+                   parse_mode="HTML", reply_markup=markup,
+                   disable_web_page_preview=True)
+    return msg.message_id if msg else None
+
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID      = "ppcjd00000007254"
@@ -259,9 +299,14 @@ class GlobalStats:
         self.last_20 = deque(maxlen=20)
         self.signals_processed = 0
 
+    # Balance global acumulado (no por ruleta)
+    global_bankroll: float = 0.0
+
     def record(self, result_type: str, attempt: int, number: int,
-               val, type_str: str, roulette_name: str, bankroll: float):
+               val, type_str: str, roulette_name: str, profit_or_loss: float):
+        """profit_or_loss: positivo en WIN, negativo en LOSS, 0 en EMPATE."""
         self.signals_processed += 1
+        self.global_bankroll = round(self.global_bankroll + profit_or_loss, 2)
         if result_type == 'WIN':
             self.wins += 1; self.consecutive += 1
         elif result_type == 'LOSS':
@@ -271,10 +316,10 @@ class GlobalStats:
         self.last_20.append({
             "result": result_type, "attempt": attempt,
             "number": number, "val": val, "type": type_str,
-            "roulette": roulette_name, "balance": bankroll
+            "roulette": roulette_name, "balance": self.global_bankroll
         })
 
-    def get_stats_text(self, total_bankroll: float) -> str:
+    def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
         text  = "📊 RESUMEN DIARIO — TODAS LAS RULETAS 📊\n"
@@ -282,7 +327,7 @@ class GlobalStats:
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance total: 💰 {total_bankroll:.2f}\n"
+        text += f"► Balance total: 💰 {self.global_bankroll:.2f}\n"
         text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
@@ -330,7 +375,6 @@ class RouletteEngine:
         self.oportunidad = 1         # 1 = entrada base, 2 = gale x3
         self.bankroll: float = 0.0
         self.active_signal_msg_id = None
-        self.skip_next_spin = False   # True = ignorar el giro en que se envió la señal
         self.spins_since_train = 0
         self.last_game_id = None
         self.ws_count = 0
@@ -487,7 +531,7 @@ class RouletteEngine:
             f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
             f"🕹️ {self.name}\n"
             f"🎯 Entrar en las {type_str}: {pair_disp}\n"
-            f"💰 Balance: {self.bankroll:.2f}\n"
+            f"💰 Balance: {GLOBAL_STATS.global_bankroll:.2f}\n"
             f"💵 Apuesta total: {total_bet:.2f}\n"
             f"🚨 (por {singular}: {bet:.2f})\n"
             f"⚔️ Cubrir el CERO 🟢\n"
@@ -506,7 +550,6 @@ class RouletteEngine:
         self.active_missing   = sig["missing"]
         self.oportunidad      = 1
         self.total_signal_loss = 0.0
-        self.skip_next_spin   = True   # ignorar el giro actual, verificar desde el siguiente
         self.send_signal()
 
     def resolve(self, number: int) -> bool:
@@ -525,9 +568,9 @@ class RouletteEngine:
             tg_send(
                 f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
                 f"🉑 Para la próxima ganaremos 0.00 🉑\n"
-                f"💰 Balance actual: {self.bankroll:.2f}"
+                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
             )
-            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, self.bankroll)
+            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, 0.0)
             self._reset_signal()
             return True
 
@@ -538,12 +581,12 @@ class RouletteEngine:
             profit = bet
             self.bankroll = round(self.bankroll + profit, 2)
             cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
+            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, profit)
             tg_send(
                 f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
                 f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
-                f"💰 Balance actual: {self.bankroll:.2f}"
+                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
             )
-            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, self.bankroll)
             self._reset_signal()
             return True
 
@@ -565,12 +608,12 @@ class RouletteEngine:
             else:
                 # ── Perdió Gale #1 → mensaje con LOSS ──────────────────────
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
+                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, -self.total_signal_loss)
                 tg_send(
                     f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
                     f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
-                    f"💰 Balance actual: {self.bankroll:.2f}"
+                    f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
                 )
-                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, self.bankroll)
                 self._reset_signal()
                 return True
 
@@ -673,13 +716,11 @@ class SessionManager:
         end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
         logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
 
-        # ── Borrar mensajes anteriores de inicio y fin ────────────────────
+        # ── Al iniciar sesión: solo borrar el mensaje de inicio anterior ──────
+        # El mensaje de fin (:25/:55) se borra cuando se envíe el SIGUIENTE fin.
         if self.prev_start_msg_id:
             tg_delete(CHAT_ID, self.prev_start_msg_id)
             self.prev_start_msg_id = None
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
 
         msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
         self.prev_start_msg_id = msg_id
@@ -693,7 +734,12 @@ class SessionManager:
         logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min.")
         self.session_active = False
 
-        msg_id = tg_send(
+        # ── Al enviar nuevo fin: borrar el mensaje de fin ANTERIOR ────────────
+        if self.prev_end_msg_id:
+            tg_delete(CHAT_ID, self.prev_end_msg_id)
+            self.prev_end_msg_id = None
+
+        text = (
             f"⏸ SESIÓN CERRADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
             f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
@@ -706,6 +752,7 @@ class SessionManager:
             f"  • Nueva Señal → Ciclo de señales\n\n"
             f"♦️ POR SESION SE ENVÍA 1 SEÑAL ♦️"
         )
+        msg_id = tg_send_with_button(text, next_name)
         self.prev_end_msg_id = msg_id
 
     # ── Watchdog: controla inicio/fin de sesión según el reloj ───────────────
@@ -781,9 +828,6 @@ class SessionManager:
             return
 
         if engine.signal_active:
-            if engine.skip_next_spin:
-                engine.skip_next_spin = False
-                return
             done = engine.resolve(number)
             if done:
                 elapsed2 = time.time() - self.session_start
@@ -1031,8 +1075,7 @@ async def daily_stats_loop():
         logger.info(f"[Stats] Próximo reporte diario en {wait_secs/3600:.1f}h")
         await asyncio.sleep(wait_secs)
         if session_mgr_global:
-            total_balance = sum(e.bankroll for e in session_mgr_global.engines)
-            tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
+            tg_send_stats(GLOBAL_STATS.get_stats_text())
             logger.info("[Stats] Reporte diario enviado al tema 40034.")
 
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
@@ -1060,14 +1103,13 @@ def cmd_status(m):
         f"<b>Estado:</b> {st}\n"
         f"<b>Tiempo restante:</b> {remaining} min\n"
         f"<b>Señal enviada:</b> {'✅' if session_mgr_global.signal_sent_this_session else '⏳'}\n"
-        f"<b>Balance:</b> {active.bankroll:.2f}",
+        f"<b>Balance global:</b> {GLOBAL_STATS.global_bankroll:.2f}",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
 def cmd_stats(m):
     if not session_mgr_global: return
-    total_balance = sum(e.bankroll for e in session_mgr_global.engines)
-    tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
+    tg_send_stats(GLOBAL_STATS.get_stats_text())
 
 @bot.message_handler(commands=['siguiente'])
 def cmd_siguiente(m):
