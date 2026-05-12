@@ -16,6 +16,12 @@ Lógica:
   - Si en los 30 min no se detecta señal, envía mensaje de cambio a la siguiente ruleta.
   - Apuesta: 0.50 por categoría (total 1.00). En gale x3 → 1.50 c/u (total 3.00). Solo 1 gale.
   - No hay niveles de gestión, solo el nivel 1 (base).
+
+CAMBIOS:
+  - Al enviar mensaje de inicio de sesión (:00/:30) se borra el anterior de inicio.
+  - Al enviar mensaje de fin de sesión (:25/:55) se borra el anterior de fin.
+  - Al iniciar, se cargan los últimos 20 resultados de la API (primer mensaje WS)
+    antes de pasar a modo real-time. Luego cada spin llega por evento en tiempo real.
 """
 
 import asyncio
@@ -48,7 +54,7 @@ for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
     logging.getLogger(_ln).setLevel(logging.ERROR)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-TOKEN   = "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw"
+TOKEN          = "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw"
 CHAT_ID        = -1003835197023
 STATS_THREAD_ID = 40034   # Tema del grupo donde se envían las estadísticas diarias
 
@@ -62,21 +68,21 @@ bot.session = _session
 
 # ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 223, "name": "ROULETTE ITALIA TRICOLORE"},
-    {"key": 222, "name": "ROULETTE DEUTSCHE (ALEMANA)"},
+    {"key": 223, "name": "ROULETTE ITALIA"},
+    {"key": 222, "name": "ROULETTE DEUTSCHE"},
     {"key": 203, "name": "SPEED ROULETTE 1"},
     {"key": 205, "name": "SPEED ROULETTE 2"},
-    {"key": 227, "name": "ROULETTE 1 (AZURE)"},
+    {"key": 227, "name": "ROULETTE 1"},
     {"key": 204, "name": "MEGA ROULETTE"},
     {"key": 206, "name": "ROULETTE MACAO"},
 ]
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL           = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID        = "ppcjd00000007254"
-SESSION_ACTIVE   = 25 * 60    # 25 min de señales activas
-SESSION_PAUSE    = 5  * 60    # 5 min de pausa entre sesiones
-SESSION_TOTAL    = SESSION_ACTIVE + SESSION_PAUSE  # 30 min = ciclo exacto por hora
+WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID      = "ppcjd00000007254"
+SESSION_ACTIVE = 25 * 60    # 25 min de señales activas
+SESSION_PAUSE  = 5  * 60    # 5 min de pausa entre sesiones
+SESSION_TOTAL  = SESSION_ACTIVE + SESSION_PAUSE   # 30 min = ciclo exacto por hora
 BASE_BET       = 0.50
 WARMUP_SPINS   = 25
 MIN_PROB       = 0.78
@@ -563,8 +569,8 @@ class RouletteEngine:
                     self.active_signal_msg_id = None
                 self.oportunidad    = 2
                 self.skip_next_spin = True   # ignorar el giro actual, verificar desde el siguiente
-                self.send_signal()   # nuevo mensaje con GALE #1
-                return False         # señal sigue activa
+                self.send_signal()           # nuevo mensaje con GALE #1
+                return False                 # señal sigue activa
 
             else:
                 # ── Perdió 2° intento (gale) → editar mensaje con LOSS ──────
@@ -624,6 +630,10 @@ class SessionManager:
       - 25 min activos (señales) + 5 min de pausa → 48 sesiones/día
       - 5 ruletas rotando en orden. Al terminar la 5ª vuelve a la 1ª.
       - Solo la ruleta activa puede emitir señal; las demás acumulan datos.
+
+    MENSAJES:
+      - Al enviar el mensaje de inicio (:00/:30) se elimina el anterior de inicio.
+      - Al enviar el mensaje de fin (:25/:55) se elimina el anterior de fin.
     """
     ARG_UTC_OFFSET = -3
 
@@ -635,6 +645,11 @@ class SessionManager:
         self.session_start     = 0.0      # epoch del inicio del slot actual
         self.session_active    = False    # True durante los 25 min activos
         self.signal_sent_this_session = False
+
+        # ── IDs para borrar mensajes anteriores ───────────────────────────────
+        self.prev_start_msg_id: Optional[int] = None   # msg de :00/:30 anterior
+        self.prev_end_msg_id:   Optional[int] = None   # msg de :25/:55 anterior
+
         logger.info("[SessionManager] Iniciado — esperando próximo slot en punto o media hora.")
 
     # ── Hora Argentina ────────────────────────────────────────────────────────
@@ -646,10 +661,8 @@ class SessionManager:
     def seconds_to_next_slot(self) -> float:
         import datetime
         now = self._now_arg()
-        # Si estamos exactamente en el slot (±5 s) arrancamos de inmediato
         if now.second <= 5 and now.minute in (0, 30):
             return 0.0
-        # Próximo slot: el :00 o :30 más cercano en el futuro
         if now.minute < 30:
             target = now.replace(minute=30, second=0, microsecond=0)
         else:
@@ -659,7 +672,6 @@ class SessionManager:
 
     # ── Calcular el índice de ruleta según el slot del día ───────────────────
     def _slot_index_for_now(self) -> int:
-        """Cada día tiene 48 slots (HH:00 y HH:30). La ruleta rota cada slot."""
         now = self._now_arg()
         slot_of_day = now.hour * 2 + (1 if now.minute >= 30 else 0)
         return slot_of_day % len(self.engines)
@@ -675,19 +687,30 @@ class SessionManager:
         now_str = self._now_arg().strftime("%H:%M")
         end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
         logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
-        tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
+
+        # ── Borrar mensaje anterior de inicio antes de enviar el nuevo ────────
+        if self.prev_start_msg_id:
+            tg_delete(CHAT_ID, self.prev_start_msg_id)
+            self.prev_start_msg_id = None
+
+        msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
+        self.prev_start_msg_id = msg_id
 
     # ── Cerrar sesión activa (entra en pausa 5 min) ───────────────────────────
     def _end_session(self):
         import datetime
         engine = self.engines[self.current_idx]
-        # Calcular la ruleta que viene en el próximo slot
         next_idx  = (self.current_idx + 1) % len(self.engines)
         next_name = self.engines[next_idx].name
-        next_slot = (self._now_arg() + datetime.timedelta(minutes=5)).strftime("%H:%M")
-        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min hasta el próximo slot.")
+        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min.")
         self.session_active = False
-        tg_send(
+
+        # ── Borrar mensaje anterior de fin antes de enviar el nuevo ──────────
+        if self.prev_end_msg_id:
+            tg_delete(CHAT_ID, self.prev_end_msg_id)
+            self.prev_end_msg_id = None
+
+        msg_id = tg_send(
             f"⏸ SESIÓN TERMINADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
             f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
@@ -696,21 +719,10 @@ class SessionManager:
             f"🕒 DURACION DE SESION: 25 minutos\n"
             f"♦️ POR SESION SE ENVIA 1 SEÑAL"
         )
-
-    # ── Banner de próxima ruleta ───────────────────────────────────────────────
-    def _send_next_roulette_banner(self, idx: int):
-        name = self.engines[idx].name
-        tg_send(
-            f"🎰 PRÓXIMA RULETA — {name} 🎰\n\n"
-            f"💵 Monto de apuesta es 0.50 para cada categoría en total de apuesta en la "
-            f"1° Oportunidad es 1.00, en caso de perder, en la 2° Oportunidad se "
-            f"multiplica x3 monto de apuesta 1.50 para cada categoría en total es 3.00"
-        )
+        self.prev_end_msg_id = msg_id
 
     # ── Watchdog: controla inicio/fin de sesión según el reloj ───────────────
     async def session_watchdog(self):
-        import datetime
-
         # Esperar al primer slot
         wait = self.seconds_to_next_slot()
         logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
@@ -723,20 +735,16 @@ class SessionManager:
             engine  = self.engines[self.current_idx]
 
             if self.session_active:
-                # ── Dentro de los 25 min activos ──────────────────────────
                 if elapsed >= SESSION_ACTIVE:
-                    # Si hay señal en curso, esperar que termine
                     if engine.signal_active:
                         continue
                     self._end_session()
-                    # Dormir los 5 min de pausa restantes hasta el slot exacto
                     pause_remaining = SESSION_TOTAL - elapsed
                     if pause_remaining > 0:
                         logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
                         await asyncio.sleep(pause_remaining)
                     self._start_session()
             else:
-                # ── En pausa — no debería llegar aquí (sleep arriba) ──────
                 if elapsed >= SESSION_TOTAL:
                     self._start_session()
 
@@ -745,15 +753,15 @@ class SessionManager:
         engine.feed_number(number, active=True)
 
         if not self.session_active:
-            return  # en pausa, no procesar señales
+            return
 
         elapsed = time.time() - self.session_start
         if elapsed >= SESSION_ACTIVE:
-            return  # tiempo activo agotado, watchdog cerrará la sesión
+            return
 
         if engine.signal_active:
             if engine.skip_next_spin:
-                engine.skip_next_spin = False   # este giro se ignora, el próximo ya verifica
+                engine.skip_next_spin = False
                 return
             done = engine.resolve(number)
             if done:
@@ -784,40 +792,177 @@ class SessionManager:
                 self.tick_passive(engine, number)
             break
 
+    # ── Avanzar ruleta manualmente (comando /siguiente) ───────────────────────
+    def _advance_session(self):
+        self._end_session()
+        self.current_idx = (self.current_idx + 1) % len(self.engines)
+        self.session_start = time.time()
+        self.session_active = True
+        self.signal_sent_this_session = False
+
 
 # ─── WS READER POR RULETA ─────────────────────────────────────────────────────
 async def ws_reader(ws_key: int, session_mgr: SessionManager):
+    """
+    Lee datos WebSocket para una ruleta con polling activo de 1 segundo.
+
+    Deduplicación:
+      - Cada jugada tiene un game_id único proporcionado por el servidor.
+      - Se mantiene un set `seen_ids` acotado (máx 200 IDs) + deque para
+        limpiar los más antiguos automáticamente y evitar crecimiento infinito.
+      - TODAS las rutas de entrada (last20Results y fallback directo) pasan
+        por `is_new_id()` antes de procesar. Si el ID ya fue visto → descartado.
+      - En la carga inicial los 20 IDs se registran en seen_ids sin procesar
+        en tiempo real, evitando que el polling los reprocese.
+
+    Flujo:
+      1. Primera conexión → carga 20 giros iniciales de la API (sin DB, sin señales).
+      2. Polling paralelo de 1s → garantiza datos frescos para ruletas rápidas.
+      3. Cualquier giro nuevo detectado pasa por is_new_id() antes de on_number().
+    """
     reconnect_delay = 5
-    last_game_id = None
+    initial_loaded = False   # True tras carga inicial de los primeros 20
+
+    # ── Deduplicación por ID único de jugada ──────────────────────────────────
+    seen_ids: set  = set()
+    seen_ids_queue: deque = deque(maxlen=200)   # límite de memoria: máx 200 IDs
+
+    def is_new_id(gid: str) -> bool:
+        """
+        Devuelve True si el game_id es nuevo y lo registra.
+        Devuelve False si ya fue procesado (duplicado → descartar).
+        Cuando la cola alcanza su límite (200), expulsa el ID más antiguo
+        del set para liberar memoria.
+        """
+        if not gid or gid in seen_ids:
+            return False
+        # Si la cola está llena, el próximo append expulsará seen_ids_queue[0]
+        # → lo eliminamos del set antes de que desaparezca del deque
+        if len(seen_ids_queue) == seen_ids_queue.maxlen:
+            seen_ids.discard(seen_ids_queue[0])
+        seen_ids.add(gid)
+        seen_ids_queue.append(gid)
+        return True
+
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=30, ping_timeout=60, close_timeout=10) as ws:
-                await ws.send(json.dumps({"type": "subscribe", "key": ws_key, "casinoId": CASINO_ID}))
-                logger.info(f"[WS-{ws_key}] ✅ Conectado")
+            async with websockets.connect(
+                WS_URL, ping_interval=20, ping_timeout=40, close_timeout=10
+            ) as ws:
+                await ws.send(json.dumps({
+                    "type": "subscribe", "key": ws_key, "casinoId": CASINO_ID
+                }))
+                logger.info(f"[WS-{ws_key}] ✅ Conectado | polling 1s | dedup activo")
                 reconnect_delay = 5
-                async for raw in ws:
-                    try: data = json.loads(raw)
-                    except: continue
-                    if not isinstance(data, dict): continue
-                    results = data.get("last20Results")
-                    if results and isinstance(results, list):
-                        latest = results[0]
-                        gid = str(latest.get("gameId", ""))
-                        if gid == last_game_id: continue
-                        last_game_id = gid
-                        try: n = int(latest.get("result", ""))
-                        except: continue
-                        if 0 <= n <= 36:
-                            session_mgr.on_number(ws_key, n)
-                        continue
-                    for key in ("result", "number", "outcome", "winningNumber"):
-                        if key in data:
-                            try:
-                                n = int(data[key])
-                                if 0 <= n <= 36:
-                                    session_mgr.on_number(ws_key, n)
-                            except: pass
+
+                # ── Tarea paralela: re-suscribe cada 1 segundo ────────────────
+                async def poll_1s():
+                    while True:
+                        await asyncio.sleep(1)
+                        try:
+                            await ws.send(json.dumps({
+                                "type": "subscribe",
+                                "key": ws_key,
+                                "casinoId": CASINO_ID
+                            }))
+                        except Exception:
                             break
+
+                poll_task = asyncio.create_task(poll_1s())
+
+                try:
+                    async for raw in ws:
+                        try:
+                            data = json.loads(raw)
+                        except Exception:
+                            continue
+                        if not isinstance(data, dict):
+                            continue
+
+                        results = data.get("last20Results")
+                        if results and isinstance(results, list):
+
+                            # ── CARGA INICIAL ─────────────────────────────────
+                            if not initial_loaded:
+                                initial_loaded = True
+                                engine = next(
+                                    (e for e in session_mgr.engines if e.ws_key == ws_key), None
+                                )
+                                loaded_count = 0
+                                if engine:
+                                    for item in reversed(results):
+                                        gid_init = str(item.get("gameId", ""))
+                                        # Registrar en seen_ids para que el polling
+                                        # no los reprocese como giros nuevos
+                                        if gid_init:
+                                            if len(seen_ids_queue) == seen_ids_queue.maxlen:
+                                                seen_ids.discard(seen_ids_queue[0])
+                                            seen_ids.add(gid_init)
+                                            seen_ids_queue.append(gid_init)
+                                        try:
+                                            n = int(item.get("result", ""))
+                                        except (ValueError, TypeError):
+                                            continue
+                                        if 0 <= n <= 36:
+                                            engine._update_state(n, persist=False, train_model=True)
+                                            loaded_count += 1
+                                    engine._train_models()
+                                    if not engine.warmup_done and len(engine.spin_history) >= WARMUP_SPINS:
+                                        engine.warmup_done = True
+                                        engine.ws_count = len(engine.spin_history)
+                                        logger.info(f"[WS-{ws_key}] ✅ WARMUP alcanzado tras carga inicial")
+                                    logger.info(
+                                        f"[WS-{ws_key}] 📦 {loaded_count} giros iniciales | "
+                                        f"Historia: {len(engine.spin_history)} | "
+                                        f"IDs registrados: {len(seen_ids)} | "
+                                        f"Warmup: {'✅' if engine.warmup_done else '⏳'}"
+                                    )
+                                continue
+
+                            # ── TIEMPO REAL: last20Results ────────────────────
+                            latest = results[0]
+                            gid = str(latest.get("gameId", ""))
+                            if not is_new_id(gid):
+                                continue   # duplicado (polling 1s trajo los mismos datos)
+                            try:
+                                n = int(latest.get("result", ""))
+                            except (ValueError, TypeError):
+                                continue
+                            if 0 <= n <= 36:
+                                session_mgr.on_number(ws_key, n)
+                            continue
+
+                        # ── Fallback: mensajes con número directo ─────────────
+                        # También se deduplica: si el mensaje trae gameId se usa,
+                        # si no, se construye un pseudo-ID con ws_key + número + segundo
+                        # para evitar procesar el mismo número dos veces en el mismo segundo.
+                        fallback_gid = str(data.get("gameId", "")).strip()
+                        if not fallback_gid:
+                            # pseudo-ID: ruleta + número encontrado + segundo actual
+                            for key in ("result", "number", "outcome", "winningNumber"):
+                                if key in data:
+                                    fallback_gid = f"{ws_key}_{data[key]}_{int(time.time())}"
+                                    break
+                        if not fallback_gid or not is_new_id(fallback_gid):
+                            continue   # duplicado o sin dato útil
+
+                        for key in ("result", "number", "outcome", "winningNumber"):
+                            if key in data:
+                                try:
+                                    n = int(data[key])
+                                    if 0 <= n <= 36:
+                                        session_mgr.on_number(ws_key, n)
+                                except (ValueError, TypeError):
+                                    pass
+                                break
+
+                finally:
+                    poll_task.cancel()
+                    try:
+                        await poll_task
+                    except asyncio.CancelledError:
+                        pass
+
         except Exception as e:
             logger.warning(f"[WS-{ws_key}] Desconectado: {e}. Reconectando en {reconnect_delay}s")
             await asyncio.sleep(reconnect_delay)
@@ -842,7 +987,7 @@ def health():
         return jsonify({"status": "initializing"})
     active = session_mgr_global.engines[session_mgr_global.current_idx]
     elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_SECS - elapsed)
+    remaining = max(0, SESSION_ACTIVE - elapsed)   # ← fix: SESSION_ACTIVE (no SESSION_SECS)
     return jsonify({
         "active_roulette": active.name,
         "session_elapsed_s": elapsed,
@@ -871,16 +1016,13 @@ async def daily_stats_loop():
     ARG_UTC_OFFSET = -3
     while True:
         now_utc = datetime.datetime.utcnow()
-        # Hora Argentina
         now_arg = now_utc + datetime.timedelta(hours=ARG_UTC_OFFSET)
-        # Calcular segundos hasta las 12:00 de hoy (o mañana si ya pasó)
-        target = now_arg.replace(hour=12, minute=0, second=0, microsecond=0)
+        target  = now_arg.replace(hour=12, minute=0, second=0, microsecond=0)
         if now_arg >= target:
             target += datetime.timedelta(days=1)
         wait_secs = (target - now_arg).total_seconds()
         logger.info(f"[Stats] Próximo reporte diario en {wait_secs/3600:.1f}h")
         await asyncio.sleep(wait_secs)
-        # Enviar stats unificadas al tema 40034
         if session_mgr_global:
             total_balance = sum(e.bankroll for e in session_mgr_global.engines)
             tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
@@ -904,7 +1046,7 @@ def cmd_status(m):
     if not session_mgr_global: return
     active = session_mgr_global.engines[session_mgr_global.current_idx]
     elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_SECS - elapsed) // 60
+    remaining = max(0, SESSION_ACTIVE - elapsed) // 60   # ← fix: SESSION_ACTIVE
     st = f"🟢 Señal activa: {active.active_pair}" if active.signal_active else "⚪ Esperando señal"
     bot.reply_to(m,
         f"<b>Ruleta activa:</b> {active.name}\n"
@@ -940,8 +1082,10 @@ async def main():
         daemon=True
     ).start()
 
-    tasks = [asyncio.create_task(session_mgr_global.session_watchdog()),
-             asyncio.create_task(daily_stats_loop())]
+    tasks = [
+        asyncio.create_task(session_mgr_global.session_watchdog()),
+        asyncio.create_task(daily_stats_loop()),
+    ]
     for r in ROULETTES:
         tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
     tasks.append(asyncio.create_task(self_ping_loop()))
