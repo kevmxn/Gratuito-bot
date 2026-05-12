@@ -68,11 +68,11 @@ bot.session = _session
 
 # ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 223, "name": "ROULETTE ITALIA TRICOLORE"},
-    {"key": 222, "name": "ROULETTE DEUTSCHE (ALEMANA)"},
+    {"key": 223, "name": "ROULETTE ITALIA"},
+    {"key": 222, "name": "ROULETTE DEUTSCHE"},
     {"key": 203, "name": "SPEED ROULETTE 1"},
     {"key": 205, "name": "SPEED ROULETTE 2"},
-    {"key": 227, "name": "ROULETTE 1 (AZURE)"},
+    {"key": 227, "name": "ROULETTE 1"},
     {"key": 204, "name": "MEGA ROULETTE"},
     {"key": 206, "name": "ROULETTE MACAO"},
 ]
