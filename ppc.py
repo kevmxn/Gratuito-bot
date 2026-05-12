@@ -67,6 +67,8 @@ ROULETTES = [
     {"key": 203, "name": "SPEED ROULETTE 1"},
     {"key": 205, "name": "SPEED ROULETTE 2"},
     {"key": 227, "name": "ROULETTE 1 (AZURE)"},
+    {"key": 204, "name": "MEGA ROULETTE"},
+    {"key": 206, "name": "ROULETTE MACAO"},
 ]
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
@@ -322,6 +324,7 @@ class RouletteEngine:
         self.oportunidad = 1         # 1 = entrada base, 2 = gale x3
         self.bankroll: float = 0.0
         self.active_signal_msg_id = None
+        self.skip_next_spin = False   # True = ignorar el giro en que se envió la señal
         self.spins_since_train = 0
         self.last_game_id = None
         self.ws_count = 0
@@ -497,6 +500,7 @@ class RouletteEngine:
         self.active_missing   = sig["missing"]
         self.oportunidad      = 1
         self.total_signal_loss = 0.0
+        self.skip_next_spin   = True   # ignorar el giro actual, verificar desde el siguiente
         self.send_signal()
 
     def resolve(self, number: int) -> bool:
@@ -557,7 +561,8 @@ class RouletteEngine:
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                self.oportunidad = 2
+                self.oportunidad    = 2
+                self.skip_next_spin = True   # ignorar el giro actual, verificar desde el siguiente
                 self.send_signal()   # nuevo mensaje con GALE #1
                 return False         # señal sigue activa
 
@@ -670,7 +675,7 @@ class SessionManager:
         now_str = self._now_arg().strftime("%H:%M")
         end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
         logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
-        self._send_next_roulette_banner(self.current_idx)
+        tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
 
     # ── Cerrar sesión activa (entra en pausa 5 min) ───────────────────────────
     def _end_session(self):
@@ -683,11 +688,13 @@ class SessionManager:
         logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min hasta el próximo slot.")
         self.session_active = False
         tg_send(
-            f"⏸ SESIÓN TERMINADA — {engine.name}\n\n"
+            f"⏸ SESIÓN TERMINADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
-            f"💵 Monto de apuesta es 0.50 para cada categoría en total de apuesta en la "
-            f"1° Oportunidad es 1.00, en caso de perder, en la 2° Oportunidad se "
-            f"multiplica x3 monto de apuesta 1.50 para cada categoría en total es 3.00"
+            f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
+            f"1° Op. = $0.50 USD x Docena/Columna\n"
+            f"2° Op. = $1.50 USD x Docena/Columna\n\n"
+            f"🕒 DURACION DE SESION: 25 minutos\n"
+            f"♦️ POR SESION SE ENVIA 1 SEÑAL"
         )
 
     # ── Banner de próxima ruleta ───────────────────────────────────────────────
@@ -745,6 +752,9 @@ class SessionManager:
             return  # tiempo activo agotado, watchdog cerrará la sesión
 
         if engine.signal_active:
+            if engine.skip_next_spin:
+                engine.skip_next_spin = False   # este giro se ignora, el próximo ya verifica
+                return
             done = engine.resolve(number)
             if done:
                 elapsed2 = time.time() - self.session_start
