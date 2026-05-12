@@ -49,7 +49,8 @@ for _ln in ['werkzeug', 'flask.app', 'flask', 'urllib3']:
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 TOKEN   = "8347707121:AAH1cPEDMLbm-scTJ8mUuufeEhzw3Axv2Lw"
-CHAT_ID = -1003835197023
+CHAT_ID        = -1003835197023
+STATS_THREAD_ID = 40034   # Tema del grupo donde se envían las estadísticas diarias
 
 _session = requests.Session()
 _retry = Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
@@ -69,9 +70,11 @@ ROULETTES = [
 ]
 
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
-WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
-CASINO_ID      = "ppcjd00000007254"
-SESSION_SECS   = 30 * 60       # 30 minutos por sesión
+WS_URL           = "wss://dga.pragmaticplaylive.net/ws"
+CASINO_ID        = "ppcjd00000007254"
+SESSION_ACTIVE   = 25 * 60    # 25 min de señales activas
+SESSION_PAUSE    = 5  * 60    # 5 min de pausa entre sesiones
+SESSION_TOTAL    = SESSION_ACTIVE + SESSION_PAUSE  # 30 min = ciclo exacto por hora
 BASE_BET       = 0.50
 WARMUP_SPINS   = 25
 MIN_PROB       = 0.78
@@ -114,9 +117,23 @@ def tg_send(text: str) -> Optional[int]:
     msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text, parse_mode="HTML")
     return msg.message_id if msg else None
 
+def tg_send_stats(text: str) -> Optional[int]:
+    """Envía al tema (topic) 40034 del grupo — exclusivo para el reporte diario de stats."""
+    msg = _tg_call(bot.send_message, chat_id=CHAT_ID, text=text,
+                   parse_mode="HTML", message_thread_id=STATS_THREAD_ID)
+    return msg.message_id if msg else None
+
 def tg_delete(chat_id: int, message_id: int):
     try:
         _tg_call(bot.delete_message, chat_id=chat_id, message_id=message_id)
+    except:
+        pass
+
+def tg_edit(chat_id: int, message_id: int, text: str):
+    """Edita un mensaje existente en Telegram."""
+    try:
+        _tg_call(bot.edit_message_text, text=text, chat_id=chat_id,
+                 message_id=message_id, parse_mode="HTML")
     except:
         pass
 
@@ -224,16 +241,18 @@ class OnlineEnsemblePredictor:
             return {c + 1: float(p) for c, p in enumerate(final)}
         except: return None
 
-# ─── STATS ────────────────────────────────────────────────────────────────────
-class DetailedStats:
+# ─── STATS GLOBAL UNIFICADA ───────────────────────────────────────────────────
+class GlobalStats:
+    """Estadísticas unificadas de todas las ruletas. Se envía una vez al día a las 12:00 ARG."""
+
     def __init__(self):
         self.wins = 0; self.zeros = 0; self.losses = 0
         self.consecutive = 0
         self.last_20 = deque(maxlen=20)
         self.signals_processed = 0
-        self.last_report_signals = 0
 
-    def record(self, result_type, attempt, number, val, type_str, bankroll):
+    def record(self, result_type: str, attempt: int, number: int,
+               val, type_str: str, roulette_name: str, bankroll: float):
         self.signals_processed += 1
         if result_type == 'WIN':
             self.wins += 1; self.consecutive += 1
@@ -241,35 +260,37 @@ class DetailedStats:
             self.losses += 1; self.consecutive = 0
         elif result_type == 'EMPATE':
             self.zeros += 1
-        self.last_20.append({"result": result_type, "attempt": attempt,
-                              "number": number, "val": val, "type": type_str, "balance": bankroll})
+        self.last_20.append({
+            "result": result_type, "attempt": attempt,
+            "number": number, "val": val, "type": type_str,
+            "roulette": roulette_name, "balance": bankroll
+        })
 
-    def should_send(self) -> bool:
-        return (self.signals_processed - self.last_report_signals) >= 20
-
-    def mark_sent(self):
-        self.last_report_signals = self.signals_processed
-
-    def get_stats_text(self, bankroll: float, roulette_name: str = "") -> str:
+    def get_stats_text(self, total_bankroll: float) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = f"📊 RESUMEN DE SEÑALES — {roulette_name} 📊\n"
+        text  = "📊 RESUMEN DIARIO — TODAS LAS RULETAS 📊\n"
+        text += f"🕛 Reporte 12:00 hs (Argentina)\n\n"
         text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
         text += f"► Consecutivas = {self.consecutive}\n"
         text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance actual: 💰 {bankroll:.2f}\n"
-        text += f"► Total señales procesadas: {total}\n\n"
+        text += f"► Balance total: 💰 {total_bankroll:.2f}\n"
+        text += f"► Total señales del día: {total}\n\n"
         text += "📌 Últimas 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
             a_str = f"🔄 GALE #{s['attempt']}"
             b_str = f"💰 {s['balance']:.2f}"
+            rl    = s['roulette'][:14]
             if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
             elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {a_str} | {b_str}\n"
+                text += f"🟠 EMPATE #0 ZERO | {rl} | {a_str} | {b_str}\n"
             else:
-                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {a_str} | {b_str}\n"
+                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
         return text
+
+# Instancia global única de stats
+GLOBAL_STATS = GlobalStats()
 
 # ─── ENGINE POR RULETA ────────────────────────────────────────────────────────
 class RouletteEngine:
@@ -300,7 +321,6 @@ class RouletteEngine:
         self.total_signal_loss = 0.0
         self.oportunidad = 1         # 1 = entrada base, 2 = gale x3
         self.bankroll: float = 0.0
-        self.stats = DetailedStats()
         self.active_signal_msg_id = None
         self.spins_since_train = 0
         self.last_game_id = None
@@ -451,21 +471,19 @@ class RouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
-        if self.oportunidad == 1:
-            bet = BASE_BET
-            total_bet = bet * 2
-            oport_label = "1° Oportunidad"
-        else:
-            bet = BASE_BET * 3
-            total_bet = bet * 2
-            oport_label = "2° Oportunidad"
-        return (f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
-                f"🕹️ {self.name}\n"
-                f"🎯 Entrar en las {type_str}: {pair_disp}\n"
-                f"💰 Balance: {self.bankroll:.2f}\n"
-                f"💵 Apuesta total: {total_bet:.2f} (por {singular}: {bet:.2f}) — {oport_label}\n"
-                f"⚔️ Cubrir el CERO 🟢\n"
-                f"🛟 Max: 1 Gale")
+        gale_num  = self.oportunidad - 1   # 0 = entrada base, 1 = gale
+        bet       = BASE_BET if gale_num == 0 else BASE_BET * 3
+        total_bet = bet * 2
+        return (
+            f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
+            f"🕹️ {self.name}\n"
+            f"🎯 Entrar en las {type_str}: {pair_disp}\n"
+            f"💰 Balance: {self.bankroll:.2f}\n"
+            f"💵 Apuesta total: {total_bet:.2f}\n"
+            f"🚨 (por {singular}: {bet:.2f})\n"
+            f"⚔️ Cubrir el CERO 🟢\n"
+            f"🛟 GALE #{gale_num}"
+        )
 
     def send_signal(self):
         msg_id = tg_send(self._build_signal_text())
@@ -473,69 +491,90 @@ class RouletteEngine:
             self.active_signal_msg_id = msg_id
 
     def iniciar_senal(self, sig: dict):
-        self.signal_active = True
-        self.active_type = sig["type"]
-        self.active_pair = sig["pair"]
-        self.active_missing = sig["missing"]
-        self.oportunidad = 1
+        self.signal_active    = True
+        self.active_type      = sig["type"]
+        self.active_pair      = sig["pair"]
+        self.active_missing   = sig["missing"]
+        self.oportunidad      = 1
         self.total_signal_loss = 0.0
         self.send_signal()
 
-    def resolve(self, number: int):
+    def resolve(self, number: int) -> bool:
         """Resolver resultado. Retorna True si la señal terminó."""
-        color = REAL_COLOR_MAP.get(number, "VERDE")
-        d, c = get_dozen(number), get_column(number)
+        color    = REAL_COLOR_MAP.get(number, "VERDE")
+        d, c     = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        gale_num = self.oportunidad - 1
+        intento  = self.oportunidad   # 1 o 2
+        bet      = BASE_BET if intento == 1 else BASE_BET * 3
 
-        if self.oportunidad == 1:
-            bet = BASE_BET
-        else:
-            bet = BASE_BET * 3
+        gale_num = intento - 1  # 0 = entrada base, 1 = gale
 
+        # ── CERO ──────────────────────────────────────────────────────────────
         if number == 0:
-            tg_send(f"🟠 EMPATE {number} — ZERO — 🔄 GALE #{gale_num}\n"
-                    f"🉑 Para la próxima ganaremos 0.00 🉑\n"
-                    f"💰 Balance actual: {self.bankroll:.2f}")
-            self.stats.record('EMPATE', gale_num, 0, 0, type_str, self.bankroll)
-            self._check_stats()
+            result_text = (
+                f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
+                f"🉑 Para la próxima ganaremos {self.bankroll:.2f} 🉑\n"
+                f"💰 Balance actual: {self.bankroll:.2f}"
+            )
+            if self.active_signal_msg_id:
+                tg_edit(CHAT_ID, self.active_signal_msg_id,
+                        self._build_signal_text() + f"\n\n{result_text}")
+            else:
+                tg_send(result_text)
+            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, self.bankroll)
             self._reset_signal()
             return True
 
-        won = (type_str == "DOCENA" and d != 0 and f"D{d}" in self.active_pair) or \
+        won = (type_str == "DOCENA"  and d != 0 and f"D{d}" in self.active_pair) or \
               (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
         if won:
             profit = bet
             self.bankroll = round(self.bankroll + profit, 2)
-            tg_send(f"✅ WIN {number} — {type_str} {val_num} — 🔄 GALE #{gale_num}\n"
-                    f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
-                    f"💰 Balance actual: {self.bankroll:.2f}")
-            self.stats.record('WIN', gale_num, number, val_num, type_str, self.bankroll)
-            self._check_stats()
+            cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
+            result_text = (
+                f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
+                f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
+                f"💰 Balance actual: {self.bankroll:.2f}"
+            )
+            if self.active_signal_msg_id:
+                tg_edit(CHAT_ID, self.active_signal_msg_id,
+                        self._build_signal_text() + f"\n\n{result_text}")
+            else:
+                tg_send(result_text)
+            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, self.bankroll)
             self._reset_signal()
             return True
+
         else:
             loss = bet * 2
-            self.bankroll = round(self.bankroll - loss, 2)
+            self.bankroll          = round(self.bankroll - loss, 2)
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
-            if gale_num == 0:
-                # Primer intento perdido → activar gale
+            if intento == 1:
+                # ── Perdió 1° intento → borrar mensaje, enviar 2° oportunidad ──
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
                 self.oportunidad = 2
-                self.send_signal()
-                return False   # señal aún activa
+                self.send_signal()   # nuevo mensaje con GALE #1
+                return False         # señal sigue activa
+
             else:
-                # Gale perdido → señal terminada
-                tg_send(f"❌ LOSS {number} — {type_str} {val_num} — 🔄 GALE #1\n"
-                        f"🚨 Señal perdida. Monto total perdido: -{self.total_signal_loss:.2f} 🚨\n"
-                        f"💰 Balance actual: {self.bankroll:.2f}")
-                self.stats.record('LOSS', 1, number, val_num, type_str, self.bankroll)
-                self._check_stats()
+                # ── Perdió 2° intento (gale) → editar mensaje con LOSS ──────
+                cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
+                result_text = (
+                    f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
+                    f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
+                    f"💰 Balance actual: {self.bankroll:.2f}"
+                )
+                if self.active_signal_msg_id:
+                    tg_edit(CHAT_ID, self.active_signal_msg_id,
+                            self._build_signal_text() + f"\n\n{result_text}")
+                else:
+                    tg_send(result_text)
+                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, self.bankroll)
                 self._reset_signal()
                 return True
 
@@ -547,46 +586,97 @@ class RouletteEngine:
         self.oportunidad = 1
         self.active_signal_msg_id = None
 
-    def _check_stats(self):
-        if not self.stats.should_send(): return
-        tg_send(self.stats.get_stats_text(self.bankroll, self.name))
-        self.stats.mark_sent()
+    def feed_number(self, number: int, active: bool = False):
+        """Alimentar número al estado del engine. Persiste en DB y loguea en consola."""
+        color  = REAL_COLOR_MAP.get(number, "VERDE")
+        d      = get_dozen(number)
+        c      = get_column(number)
+        tag    = "🟢 ACTIVA" if active else "⚫ pasiva"
+        spin_n = len(self.spin_history) + 1  # antes del update
 
-    def feed_number(self, number: int):
-        """Alimentar número al estado del engine (sin lógica de señal — solo datos)."""
-        self._update_state(number)
+        self._update_state(number)           # persiste en DB aquí
+
         if not self.warmup_done:
             self.ws_count += 1
+            warmup_tag = f"⏳ warmup {self.ws_count}/{WARMUP_SPINS}"
             if self.ws_count >= WARMUP_SPINS:
                 self.warmup_done = True
-                logger.info(f"[{self.name}] ✅ WARMUP completado")
+                warmup_tag = "✅ WARMUP listo"
+        else:
+            warmup_tag = "✔"
+
+        logger.info(
+            f"[{self.name}] 🎰 #{spin_n:>4} | {number:>2} {color:<5} D{d} C{c} "
+            f"| {tag} | {warmup_tag} | 💾 guardado"
+        )
 
 
 # ─── GESTOR DE SESIONES ───────────────────────────────────────────────────────
 class SessionManager:
     """
-    Controla la rotación de ruletas en slots de 30 min.
-    Mientras una ruleta está activa en sesión, recibe todos los números vía WS
-    y puede emitir UNA señal.
-    Las demás ruletas también reciben datos vía WS (mantienen su modelo caliente),
-    pero no emiten señales.
+    Sesiones sincronizadas al reloj:
+      - Arrancan en HH:00 y HH:30 exactos (hora Argentina UTC-3)
+      - 25 min activos (señales) + 5 min de pausa → 48 sesiones/día
+      - 5 ruletas rotando en orden. Al terminar la 5ª vuelve a la 1ª.
+      - Solo la ruleta activa puede emitir señal; las demás acumulan datos.
     """
+    ARG_UTC_OFFSET = -3
 
     def __init__(self):
         self.engines: list[RouletteEngine] = [
             RouletteEngine(r["key"], r["name"]) for r in ROULETTES
         ]
-        self.current_idx = 0
-        self.session_start = time.time()
+        self.current_idx       = 0
+        self.session_start     = 0.0      # epoch del inicio del slot actual
+        self.session_active    = False    # True durante los 25 min activos
         self.signal_sent_this_session = False
+        logger.info("[SessionManager] Iniciado — esperando próximo slot en punto o media hora.")
 
-        # WS: un reader por ruleta para alimentar datos continuamente
-        # Pero solo la ruleta activa puede emitir señal
-        self.ws_queues: dict[int, asyncio.Queue] = {
-            e.ws_key: asyncio.Queue() for e in self.engines
-        }
-        logger.info("[SessionManager] Iniciado. Primera ruleta: " + self.engines[0].name)
-        self._send_next_roulette_banner(0)
+    # ── Hora Argentina ────────────────────────────────────────────────────────
+    def _now_arg(self):
+        import datetime
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=self.ARG_UTC_OFFSET)
+
+    # ── Calcular cuántos segundos faltan para el próximo slot (HH:00 o HH:30) ─
+    def seconds_to_next_slot(self) -> float:
+        import datetime
+        now = self._now_arg()
+        # Si estamos exactamente en el slot (±5 s) arrancamos de inmediato
+        if now.second <= 5 and now.minute in (0, 30):
+            return 0.0
+        # Próximo slot: el :00 o :30 más cercano en el futuro
+        if now.minute < 30:
+            target = now.replace(minute=30, second=0, microsecond=0)
+        else:
+            target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        diff = (target - now).total_seconds()
+        return max(0.0, diff)
+
+    # ── Calcular el índice de ruleta según el slot del día ───────────────────
+    def _slot_index_for_now(self) -> int:
+        """Cada día tiene 48 slots (HH:00 y HH:30). La ruleta rota cada slot."""
+        now = self._now_arg()
+        slot_of_day = now.hour * 2 + (1 if now.minute >= 30 else 0)
+        return slot_of_day % len(self.engines)
+
+    # ── Iniciar sesión activa ─────────────────────────────────────────────────
+    def _start_session(self):
+        import datetime
+        self.current_idx   = self._slot_index_for_now()
+        self.session_start = time.time()
+        self.session_active = True
+        self.signal_sent_this_session = False
+        engine = self.engines[self.current_idx]
+        now_str = self._now_arg().strftime("%H:%M")
+        end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
+        logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
+        self._send_next_roulette_banner(self.current_idx)
+
+    # ── Cerrar sesión activa (entra en pausa 5 min) ───────────────────────────
+    def _end_session(self):
+        engine = self.engines[self.current_idx]
+        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min hasta el próximo slot.")
+        self.session_active = False
 
     # ── Banner de próxima ruleta ───────────────────────────────────────────────
     def _send_next_roulette_banner(self, idx: int):
@@ -598,42 +688,58 @@ class SessionManager:
             f"multiplica x3 monto de apuesta 1.50 para cada categoría en total es 3.00"
         )
 
-    # ── Avanzar sesión ────────────────────────────────────────────────────────
-    def _advance_session(self):
-        next_idx = (self.current_idx + 1) % len(self.engines)
-        logger.info(f"[SessionManager] Sesión terminada → cambiando a {self.engines[next_idx].name}")
-        self.current_idx = next_idx
-        self.session_start = time.time()
-        self.signal_sent_this_session = False
-        self._send_next_roulette_banner(next_idx)
+    # ── Watchdog: controla inicio/fin de sesión según el reloj ───────────────
+    async def session_watchdog(self):
+        import datetime
 
-    # ── Tick de sesión (llamado por cada número recibido en la ruleta activa) ─
+        # Esperar al primer slot
+        wait = self.seconds_to_next_slot()
+        logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
+        await asyncio.sleep(wait)
+        self._start_session()
+
+        while True:
+            await asyncio.sleep(1)
+            elapsed = time.time() - self.session_start
+            engine  = self.engines[self.current_idx]
+
+            if self.session_active:
+                # ── Dentro de los 25 min activos ──────────────────────────
+                if elapsed >= SESSION_ACTIVE:
+                    # Si hay señal en curso, esperar que termine
+                    if engine.signal_active:
+                        continue
+                    self._end_session()
+                    # Dormir los 5 min de pausa restantes hasta el slot exacto
+                    pause_remaining = SESSION_TOTAL - elapsed
+                    if pause_remaining > 0:
+                        logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
+                        await asyncio.sleep(pause_remaining)
+                    self._start_session()
+            else:
+                # ── En pausa — no debería llegar aquí (sleep arriba) ──────
+                if elapsed >= SESSION_TOTAL:
+                    self._start_session()
+
+    # ── Tick de sesión activa ─────────────────────────────────────────────────
     def tick_active(self, engine: RouletteEngine, number: int):
-        """Procesa número para la ruleta activa en sesión."""
-        engine.feed_number(number)
+        engine.feed_number(number, active=True)
 
-        # Verificar timeout de sesión
+        if not self.session_active:
+            return  # en pausa, no procesar señales
+
         elapsed = time.time() - self.session_start
-        if elapsed >= SESSION_SECS:
-            # Tiempo agotado sin señal
-            if not self.signal_sent_this_session and engine.signal_active:
-                # Hay una señal en curso → dejarla terminar antes de cambiar
-                pass
-            elif not self.signal_sent_this_session:
-                self._advance_session()
-            return
+        if elapsed >= SESSION_ACTIVE:
+            return  # tiempo activo agotado, watchdog cerrará la sesión
 
-        # Si ya se emitió señal esta sesión, solo resolver si hay señal activa
         if engine.signal_active:
             done = engine.resolve(number)
             if done:
-                # Señal terminada → esperar hasta fin de sesión o rotar si ya pasó el tiempo
                 elapsed2 = time.time() - self.session_start
-                if elapsed2 >= SESSION_SECS:
-                    self._advance_session()
+                if elapsed2 >= SESSION_ACTIVE:
+                    self._end_session()
             return
 
-        # No hay señal activa y no se emitió aún: intentar detectar
         if not self.signal_sent_this_session and engine.warmup_done:
             sig = engine.detect_signal()
             if sig:
@@ -641,24 +747,11 @@ class SessionManager:
                 engine.iniciar_senal(sig)
                 self.signal_sent_this_session = True
 
-    # ── Tick pasivo (ruletas no activas — solo acumular datos) ────────────────
+    # ── Tick pasivo ───────────────────────────────────────────────────────────
     def tick_passive(self, engine: RouletteEngine, number: int):
-        engine.feed_number(number)
+        engine.feed_number(number, active=False)
 
-    # ── Verificar timeout periódico (sin números entrantes) ───────────────────
-    async def session_watchdog(self):
-        """Revisa cada segundo si la sesión activa expiró sin señal."""
-        while True:
-            await asyncio.sleep(1)
-            elapsed = time.time() - self.session_start
-            engine = self.engines[self.current_idx]
-            if elapsed >= SESSION_SECS:
-                if engine.signal_active:
-                    # Esperamos que termine la señal
-                    continue
-                self._advance_session()
-
-    # ── Punto de entrada de número desde WS ───────────────────────────────────
+    # ── Entrada de número desde WS ────────────────────────────────────────────
     def on_number(self, ws_key: int, number: int):
         for i, engine in enumerate(self.engines):
             if engine.ws_key != ws_key:
@@ -750,15 +843,37 @@ async def self_ping_loop():
         except: pass
         await asyncio.sleep(240)
 
+async def daily_stats_loop():
+    """Envía estadísticas unificadas a las 12:00 hs de Argentina (UTC-3) cada día."""
+    import datetime
+    ARG_UTC_OFFSET = -3
+    while True:
+        now_utc = datetime.datetime.utcnow()
+        # Hora Argentina
+        now_arg = now_utc + datetime.timedelta(hours=ARG_UTC_OFFSET)
+        # Calcular segundos hasta las 12:00 de hoy (o mañana si ya pasó)
+        target = now_arg.replace(hour=12, minute=0, second=0, microsecond=0)
+        if now_arg >= target:
+            target += datetime.timedelta(days=1)
+        wait_secs = (target - now_arg).total_seconds()
+        logger.info(f"[Stats] Próximo reporte diario en {wait_secs/3600:.1f}h")
+        await asyncio.sleep(wait_secs)
+        # Enviar stats unificadas al tema 40034
+        if session_mgr_global:
+            total_balance = sum(e.bankroll for e in session_mgr_global.engines)
+            tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
+            logger.info("[Stats] Reporte diario enviado al tema 40034.")
+
 # ─── BOT COMMANDS ─────────────────────────────────────────────────────────────
 @bot.message_handler(commands=['start', 'help'])
 def cmd_start(m):
     bot.reply_to(m,
         "<b>🎰 Multi-Roulette Session Bot</b>\n\n"
         "5 ruletas rotando cada 30 min\n"
-        "1 señal por sesión | 48 señales/día\n\n"
+        "1 señal por sesión | 48 señales/día\n"
+        "📊 Stats unificadas enviadas a las 12:00 hs (ARG)\n\n"
         "/status — Estado actual\n"
-        "/stats — Estadísticas\n"
+        "/stats — Ver estadísticas ahora\n"
         "/siguiente — Forzar cambio de ruleta",
         parse_mode="HTML")
 
@@ -780,8 +895,8 @@ def cmd_status(m):
 @bot.message_handler(commands=['stats'])
 def cmd_stats(m):
     if not session_mgr_global: return
-    for e in session_mgr_global.engines:
-        bot.reply_to(m, e.stats.get_stats_text(e.bankroll, e.name), parse_mode="HTML")
+    total_balance = sum(e.bankroll for e in session_mgr_global.engines)
+    tg_send_stats(GLOBAL_STATS.get_stats_text(total_balance))
 
 @bot.message_handler(commands=['siguiente'])
 def cmd_siguiente(m):
@@ -803,7 +918,8 @@ async def main():
         daemon=True
     ).start()
 
-    tasks = [asyncio.create_task(session_mgr_global.session_watchdog())]
+    tasks = [asyncio.create_task(session_mgr_global.session_watchdog()),
+             asyncio.create_task(daily_stats_loop())]
     for r in ROULETTES:
         tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
     tasks.append(asyncio.create_task(self_ping_loop()))
