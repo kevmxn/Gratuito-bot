@@ -674,9 +674,21 @@ class SessionManager:
 
     # ── Cerrar sesión activa (entra en pausa 5 min) ───────────────────────────
     def _end_session(self):
+        import datetime
         engine = self.engines[self.current_idx]
+        # Calcular la ruleta que viene en el próximo slot
+        next_idx  = (self.current_idx + 1) % len(self.engines)
+        next_name = self.engines[next_idx].name
+        next_slot = (self._now_arg() + datetime.timedelta(minutes=5)).strftime("%H:%M")
         logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min hasta el próximo slot.")
         self.session_active = False
+        tg_send(
+            f"⏸ SESIÓN TERMINADA — {engine.name}\n\n"
+            f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
+            f"💵 Monto de apuesta es 0.50 para cada categoría en total de apuesta en la "
+            f"1° Oportunidad es 1.00, en caso de perder, en la 2° Oportunidad se "
+            f"multiplica x3 monto de apuesta 1.50 para cada categoría en total es 3.00"
+        )
 
     # ── Banner de próxima ruleta ───────────────────────────────────────────────
     def _send_next_roulette_banner(self, idx: int):
