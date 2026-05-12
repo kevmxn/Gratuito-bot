@@ -18,8 +18,8 @@ Lógica:
   - No hay niveles de gestión, solo el nivel 1 (base).
 
 CAMBIOS:
-  - Al enviar mensaje de inicio de sesión (:00/:30) se borra el anterior de inicio.
-  - Al enviar mensaje de fin de sesión (:25/:55) se borra el anterior de fin.
+  - Al enviar mensaje de inicio de sesión (:00/:30) se borra el anterior de inicio Y el de fin.
+  - Al enviar mensaje de fin de sesión (:25/:55) NO se borra el anterior (se borrará al iniciar la próxima).
   - Al iniciar, se cargan los últimos 20 resultados de la API (primer mensaje WS)
     antes de pasar a modo real-time. Luego cada spin llega por evento en tiempo real.
 """
@@ -553,17 +553,17 @@ class RouletteEngine:
             self.total_signal_loss = round(self.total_signal_loss + loss, 2)
 
             if intento == 1:
-                # ── Perdió 1° intento → borrar mensaje de señal, enviar GALE #1 ──
+                # ── Perdió Gale #0 → borrar mensaje de señal, enviar GALE #1 ──
+                # El próximo giro valida Gale #1 directamente (NO se salta)
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
                 self.oportunidad    = 2
-                self.skip_next_spin = True
                 self.send_signal()   # nuevo mensaje con GALE #1
                 return False         # señal sigue activa
 
             else:
-                # ── Perdió 2° intento (gale) → mensaje nuevo con LOSS ──────
+                # ── Perdió Gale #1 → mensaje con LOSS ──────────────────────
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
                 tg_send(
                     f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
@@ -617,8 +617,8 @@ class SessionManager:
       - Solo la ruleta activa puede emitir señal; las demás acumulan datos.
 
     MENSAJES:
-      - Al enviar el mensaje de inicio (:00/:30) se elimina el anterior de inicio.
-      - Al enviar el mensaje de fin (:25/:55) se elimina el anterior de fin.
+      - Al enviar mensaje de inicio (:00/:30) se elimina el anterior de inicio Y el de fin.
+      - Al enviar mensaje de fin (:25/:55) solo se guarda el ID (se borrará al iniciar la próxima).
     """
     ARG_UTC_OFFSET = -3
 
@@ -673,10 +673,13 @@ class SessionManager:
         end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
         logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
 
-        # ── Borrar mensaje anterior de inicio antes de enviar el nuevo ────────
+        # ── Borrar mensajes anteriores de inicio y fin ────────────────────
         if self.prev_start_msg_id:
             tg_delete(CHAT_ID, self.prev_start_msg_id)
             self.prev_start_msg_id = None
+        if self.prev_end_msg_id:
+            tg_delete(CHAT_ID, self.prev_end_msg_id)
+            self.prev_end_msg_id = None
 
         msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
         self.prev_start_msg_id = msg_id
@@ -690,19 +693,18 @@ class SessionManager:
         logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} | Pausa 5 min.")
         self.session_active = False
 
-        # ── Borrar mensaje anterior de fin antes de enviar el nuevo ──────────
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
-
         msg_id = tg_send(
-            f"⏸ SESIÓN TERMINADA — {engine.name}\n"
+            f"⏸ SESIÓN CERRADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
             f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
             f"1° Op. = $0.50 USD x Docena/Columna\n"
             f"2° Op. = $1.50 USD x Docena/Columna\n\n"
-            f"🕒 DURACION DE SESION: 25 minutos\n"
-            f"♦️ POR SESION SE ENVIA 1 SEÑAL"
+            f"🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n"
+            f"  • Se envía señal → Se resuelve\n"
+            f"  • Sesión se cierra → Ej: 12:25 o 12:55\n"
+            f"  • Nueva Sesión → Ej: 15:00 o 15:30\n"
+            f"  • Nueva Señal → Ciclo de señales\n\n"
+            f"♦️ POR SESION SE ENVÍA 1 SEÑAL ♦️"
         )
         self.prev_end_msg_id = msg_id
 
@@ -847,16 +849,8 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
     seen_ids_queue: deque = deque(maxlen=200)   # límite de memoria: máx 200 IDs
 
     def is_new_id(gid: str) -> bool:
-        """
-        Devuelve True si el game_id es nuevo y lo registra.
-        Devuelve False si ya fue procesado (duplicado → descartar).
-        Cuando la cola alcanza su límite (200), expulsa el ID más antiguo
-        del set para liberar memoria.
-        """
         if not gid or gid in seen_ids:
             return False
-        # Si la cola está llena, el próximo append expulsará seen_ids_queue[0]
-        # → lo eliminamos del set antes de que desaparezca del deque
         if len(seen_ids_queue) == seen_ids_queue.maxlen:
             seen_ids.discard(seen_ids_queue[0])
         seen_ids.add(gid)
@@ -911,8 +905,6 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                                 if engine:
                                     for item in reversed(results):
                                         gid_init = str(item.get("gameId", ""))
-                                        # Registrar en seen_ids para que el polling
-                                        # no los reprocese como giros nuevos
                                         if gid_init:
                                             if len(seen_ids_queue) == seen_ids_queue.maxlen:
                                                 seen_ids.discard(seen_ids_queue[0])
@@ -942,7 +934,7 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                             latest = results[0]
                             gid = str(latest.get("gameId", ""))
                             if not is_new_id(gid):
-                                continue   # duplicado (polling 1s trajo los mismos datos)
+                                continue
                             try:
                                 n = int(latest.get("result", ""))
                             except (ValueError, TypeError):
@@ -952,18 +944,14 @@ async def ws_reader(ws_key: int, session_mgr: SessionManager):
                             continue
 
                         # ── Fallback: mensajes con número directo ─────────────
-                        # También se deduplica: si el mensaje trae gameId se usa,
-                        # si no, se construye un pseudo-ID con ws_key + número + segundo
-                        # para evitar procesar el mismo número dos veces en el mismo segundo.
                         fallback_gid = str(data.get("gameId", "")).strip()
                         if not fallback_gid:
-                            # pseudo-ID: ruleta + número encontrado + segundo actual
                             for key in ("result", "number", "outcome", "winningNumber"):
                                 if key in data:
                                     fallback_gid = f"{ws_key}_{data[key]}_{int(time.time())}"
                                     break
                         if not fallback_gid or not is_new_id(fallback_gid):
-                            continue   # duplicado o sin dato útil
+                            continue
 
                         for key in ("result", "number", "outcome", "winningNumber"):
                             if key in data:
@@ -1006,7 +994,7 @@ def health():
         return jsonify({"status": "initializing"})
     active = session_mgr_global.engines[session_mgr_global.current_idx]
     elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed)   # ← fix: SESSION_ACTIVE (no SESSION_SECS)
+    remaining = max(0, SESSION_ACTIVE - elapsed)
     return jsonify({
         "active_roulette": active.name,
         "session_elapsed_s": elapsed,
@@ -1065,7 +1053,7 @@ def cmd_status(m):
     if not session_mgr_global: return
     active = session_mgr_global.engines[session_mgr_global.current_idx]
     elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed) // 60   # ← fix: SESSION_ACTIVE
+    remaining = max(0, SESSION_ACTIVE - elapsed) // 60
     st = f"🟢 Señal activa: {active.active_pair}" if active.signal_active else "⚪ Esperando señal"
     bot.reply_to(m,
         f"<b>Ruleta activa:</b> {active.name}\n"
@@ -1117,4 +1105,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot detenido.")
+        logger.info("[Main] 🛑 Bot detenido")
