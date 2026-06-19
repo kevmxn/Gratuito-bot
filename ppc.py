@@ -82,8 +82,8 @@ ROULETTE_LINKS = {
     "AUTO ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
     "ROULETTE ITALIA":        "https://1win.lat/casino/play/v_pragmatic:rouletteitaliatricolore",
     "ROULETTE 1":             "https://1win.lat/casino/play/v_pragmatic:roulette1",
-    "ROULETTE 3":             "https://1win.lat/casino/play/v_pragmatic:roulette3",
     "ROULETTE 2":             "https://1win.lat/casino/play/v_pragmatic:roulette2",
+    "ROULETTE 2 EXTRA TIME":  "https://1win.lat/casino/play/v_pragmatic:roulette2",
     "SPEED ROULETTE 1":       "https://1win.lat/casino/play/v_pragmatic:speedroulette1",
     "SPEED ROULETTE 2":       "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
     "ROULETTE MACAO":         "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
@@ -120,9 +120,9 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID      = "ppcjd00000007254"
-WIN_ROTATE_PAUSE = 5 * 60   # 5 min de espera tras WIN antes de cambiar ruleta
+WIN_ROTATE_PAUSE = 10 * 60   # 10 min de espera tras resolver señal antes de cambiar ruleta
 WARMUP_SPINS   = 25
-MIN_PROB       = 0.80
+MIN_PROB       = 0.78
 TRAIN_INTERVAL = 100
 
 REAL_COLOR_MAP: dict = {
@@ -568,10 +568,7 @@ class RouletteEngine:
 
         # ── CERO ──────────────────────────────────────────────────────────────
         if number == 0:
-            tg_send(
-                f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
-                f"🉑 Para la próxima ganaremos 🉑"
-            )
+            tg_send(f"🟠 SALIO CERO 🔄 GALE #{gale_num}")
             GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name)
             self._reset_signal()
             return True
@@ -582,10 +579,7 @@ class RouletteEngine:
         if won:
             cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
             GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name)
-            tg_send(
-                f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                f"🎉 Felicidades has ganado 🎉"
-            )
+            tg_send(f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}")
             self._reset_signal()
             return True
 
@@ -603,10 +597,7 @@ class RouletteEngine:
                 # Perdió Gale #1 → LOSS
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
                 GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name)
-                tg_send(
-                    f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                    f"🚨 Señal perdida 🚨"
-                )
+                tg_send(f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}")
                 self._reset_signal()
                 return True
 
@@ -647,7 +638,7 @@ class SessionManager:
     """
     Rotación por señal ganada:
       - Sin sesiones de tiempo fijo. La ruleta activa permanece hasta emitir 1 señal.
-      - Al ganar (WIN) una señal, se espera WIN_ROTATE_PAUSE (5 min) y se rota a la siguiente.
+      - Al resolver cualquier señal (WIN/LOSS/EMPATE), se espera WIN_ROTATE_PAUSE (10 min) y se rota.
       - En LOSS o EMPATE la sesión continúa en la misma ruleta (sin señal activa).
       - Solo la ruleta activa puede emitir señal; las demás acumulan datos en modo pasivo.
 
@@ -725,20 +716,21 @@ class SessionManager:
         self.signal_sent_this_session = False
         self._send_start_message()
 
-    # ── WIN detectado: iniciar espera de 5 min antes de rotar ────────────────
-    def _on_win(self):
-        """Llamado justo después de resolver un WIN. Inicia la pausa de 5 min."""
+    # ── Señal resuelta: iniciar espera de 10 min antes de rotar ─────────────
+    def _on_signal_resolved(self):
+        """Llamado al terminar cualquier señal (WIN/LOSS/EMPATE). Inicia la pausa de 10 min."""
         self.pending_rotation    = True
         self.rotation_start_time = time.time()
         remaining_min = WIN_ROTATE_PAUSE // 60
         engine = self.engines[self.current_idx]
+        next_name = self.engines[(self.current_idx + 1) % len(self.engines)].name
         logger.info(
-            f"[SessionManager] ✅ WIN en {engine.name} — "
-            f"esperando {remaining_min} min antes de rotar."
+            f"[SessionManager] 🔄 Señal resuelta en {engine.name} — "
+            f"esperando {remaining_min} min antes de rotar a {next_name}."
         )
         tg_send(
             f"⏳ Rotando ruleta en <b>{remaining_min} minutos</b>...\n"
-            f"🎰 Próxima: <b>{self.engines[(self.current_idx + 1) % len(self.engines)].name}</b>"
+            f"🎰 Próxima: <b>{next_name}</b>"
         )
 
     # ── Watchdog: solo vigila la rotación post-WIN ────────────────────────────
@@ -761,12 +753,8 @@ class SessionManager:
         if engine.signal_active:
             done = engine.resolve(number)
             if done:
-                # Verificar si fue WIN (la señal se resolvió satisfactoriamente)
-                # resolve() ya registró el resultado en GLOBAL_STATS;
-                # detectamos WIN por el último registro
-                last = list(GLOBAL_STATS.last_20)[-1] if GLOBAL_STATS.last_20 else None
-                if last and last.get("result") == "WIN":
-                    self._on_win()
+                # Señal resuelta (WIN / LOSS / EMPATE) → rotar ruleta en 10 min
+                self._on_signal_resolved()
             return
 
         if not self.signal_sent_this_session and engine.warmup_done:
