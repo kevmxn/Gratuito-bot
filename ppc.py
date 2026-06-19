@@ -387,8 +387,9 @@ class RouletteEngine:
         self.active_signal_msg_id = None
 
         # Estado de alerta de oportunidad
-        self.oportunidad_alerta = False   # True cuando se envió alerta de oportunidad
-        self.oportunidad_spin   = 0       # contador de giros desde la alerta (se evalúa en giro 5)
+        self.oportunidad_alerta = False         # True cuando se envió alerta de oportunidad
+        self.oportunidad_spin   = 0             # giros transcurridos desde la alerta
+        self.oportunidad_alert_msg_id: Optional[int] = None  # msg_id para poder borrarla
         self.spins_since_train = 0
         self.last_game_id = None
         self.ws_count = 0
@@ -648,13 +649,14 @@ class RouletteEngine:
         return len(dozens) == 2 or len(columns) == 2
 
     def send_oportunidad_alert(self):
-        """Envía el mensaje de alerta de oportunidad."""
-        tg_send(
+        """Envía el mensaje de alerta de oportunidad y guarda su ID para poder borrarlo."""
+        msg_id = tg_send(
             "🚨 OPORTUNIDAD EN EVALUACIÓN 🚨\n"
             "Preparado jugador para tomar la oportunidad..."
         )
-        self.oportunidad_alerta = True
-        self.oportunidad_spin   = 0
+        self.oportunidad_alerta       = True
+        self.oportunidad_spin         = 0
+        self.oportunidad_alert_msg_id = msg_id
 
     def _reset_signal(self):
         self.signal_active = False
@@ -664,6 +666,7 @@ class RouletteEngine:
         self.active_signal_msg_id = None
         self.oportunidad_alerta = False
         self.oportunidad_spin   = 0
+        self.oportunidad_alert_msg_id = None
 
     def feed_number(self, number: int, active: bool = False):
         """Alimentar número al estado del engine. Persiste en DB y loguea en consola."""
@@ -797,19 +800,34 @@ class SessionManager:
         if self.signal_sent_this_session or not engine.warmup_done:
             return
 
-        # ── Alerta de oportunidad activa → contar giro 5 ─────────────────────
+        # ── Alerta de oportunidad activa → evaluar en cada giro ──────────────
         if engine.oportunidad_alerta:
             engine.oportunidad_spin += 1
-            if engine.oportunidad_spin >= 1:   # en el giro 5 (el que llega tras la alerta)
-                sig = engine.detect_signal()
-                if sig:
-                    logger.info(f"[SessionManager] 🎯 Señal detectada (giro eval): {sig}")
-                    engine.iniciar_senal(sig)
+            sig = engine.detect_signal()
+            if sig:
+                # Hay señal → borrar alerta y confirmar entrada
+                if engine.oportunidad_alert_msg_id:
+                    tg_delete(CHAT_ID, engine.oportunidad_alert_msg_id)
+                    engine.oportunidad_alert_msg_id = None
+                engine.oportunidad_alerta = False
+                engine.oportunidad_spin   = 0
+                logger.info(f"[SessionManager] 🎯 Señal detectada tras alerta: {sig}")
+                engine.iniciar_senal(sig)
+            else:
+                # Sin señal → borrar mensaje de alerta
+                if engine.oportunidad_alert_msg_id:
+                    tg_delete(CHAT_ID, engine.oportunidad_alert_msg_id)
+                    engine.oportunidad_alert_msg_id = None
+                # ¿La tendencia PF sigue (últimos 4 en 2 docenas/columnas)?
+                engine.oportunidad_alerta = False   # reset temporal para que _check_oportunidad funcione
+                if engine._check_oportunidad():
+                    # Tendencia continúa → reenviar alerta
+                    logger.info(f"[SessionManager] 🔄 Tendencia continúa — reenviando alerta de oportunidad.")
+                    engine.send_oportunidad_alert()
                 else:
-                    # Cancelar alerta — no hubo señal
-                    logger.info(f"[SessionManager] ⚠️ Oportunidad descartada — sin señal en giro eval.")
-                    engine.oportunidad_alerta = False
-                    engine.oportunidad_spin   = 0
+                    # Tendencia rota → cancelar definitivamente
+                    engine.oportunidad_spin = 0
+                    logger.info(f"[SessionManager] ⚠️ Tendencia rota — oportunidad descartada.")
             return
 
         # ── Chequear oportunidad ──────────────────────────────────────────────
