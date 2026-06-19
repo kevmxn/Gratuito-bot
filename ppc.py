@@ -122,7 +122,7 @@ VIP_SESSIONS = [
     (17, 19),
     (21, 23),
 ]
-WARMUP_SPINS   = 300
+WARMUP_SPINS   = 200
 MIN_PROB       = 0.80
 TRAIN_INTERVAL = 100
 
@@ -777,6 +777,7 @@ class SessionManager:
 
     # ── Enviar aviso 15 min antes de iniciar sesión ───────────────────────────
     def _send_pre_session_message(self, roulette_name: str):
+        """Envía aviso 15 min antes con la ruleta de la próxima sesión (current_idx) y botón de acceso."""
         text = (
             "EN BREVE COMENZAMOS NUESTRA\n"
             "SESIÓN GRATUITA EN 15 MINUTOS 💪\n\n"
@@ -786,7 +787,7 @@ class SessionManager:
             "y aprovechar las oportunidades con más tranquilidad. 📈\n\n"
             f"⚪ USAREMOS {roulette_name} ⚪"
         )
-        tg_send(text)
+        tg_send_with_button(text, roulette_name)
         logger.info(f"[SessionManager] 🔔 Aviso pre-sesión enviado (15 min antes) — {roulette_name}")
 
     # ── Enviar aviso 10 min después de finalizar sesión ──────────────────────
@@ -825,7 +826,9 @@ class SessionManager:
                 minutes_to_start = (next_start - now).total_seconds() / 60.0
                 key = (next_idx, next_start.date(), next_start.hour)
                 if 0 <= minutes_to_start <= 15 and self._preavviso_sent_for != key:
-                    roulette_name = self.engines[next_idx].name
+                    # La ruleta de la próxima sesión es siempre self.current_idx
+                    # (current_idx avanza al TERMINAR cada sesión, no al comenzar)
+                    roulette_name = self.engines[self.current_idx].name
                     self._send_pre_session_message(roulette_name)
                     self._preavviso_sent_for = key
 
@@ -850,6 +853,10 @@ class SessionManager:
                 # Salir de sesión VIP
                 self.session_active = False
                 engine = self.engines[self.current_idx]
+                # Borrar alerta de oportunidad si sigue publicada en el chat
+                if engine.oportunidad_alerta and engine.oportunidad_alert_msg_id:
+                    tg_delete(CHAT_ID, engine.oportunidad_alert_msg_id)
+                    engine.oportunidad_alert_msg_id = None
                 engine._reset_signal()
                 self._send_end_message()
                 last_session_end = now
