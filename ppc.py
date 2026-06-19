@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-Multi-Roulette Session Bot — 5 Ruletas / Sesiones de 30 min / 48 señales/día
+Multi-Roulette Session Bot — 5 Ruletas / Rotación por señal ganada
 
 Ruletas:
-  - Roulette Italia Tricolore  — key 223
-  - Roulette Deutsche          — key 222
-  - Speed Roulette 1           — key 203
-  - Speed Roulette 2           — key 205
-  - Roulette 1 (Azure)         — key 227
+  - Turkish Roulette   — key 224
+  - Russian Roulette   — key 221
+  - Roulette Macao     — key 206
+  - Roulette 2         — key 201
+  - Auto Roulette      — key 225
 
 Lógica:
-  - Cada sesión dura 30 min (slot de tiempo fijo).
-  - Las 5 ruletas se rotan en orden. Al terminar la 5ª, vuelve a la 1ª.
-  - Cada sesión emite como máximo UNA señal.
-  - Si en los 30 min no se detecta señal, envía mensaje de cambio a la siguiente ruleta.
+  - NO hay sesiones de tiempo fijo de 30 min.
+  - La ruleta rota automáticamente luego de ganar (WIN) una señal.
+  - Tras el WIN se espera 5 minutos antes de iniciar en la siguiente ruleta.
+  - Cada sesión (ruleta activa) emite como máximo UNA señal.
+  - Si no se detecta señal, la ruleta permanece activa indefinidamente hasta emitir una.
   - Apuesta: 0.50 por categoría (total 1.00). En gale x3 → 1.50 c/u (total 3.00). Solo 1 gale.
-  - No hay niveles de gestión, solo el nivel 1 (base).
+  - Estadísticas históricas ponderadas exponencialmente (más peso a los datos recientes).
 
-CAMBIOS:
-  - Al enviar mensaje de inicio de sesión (:00/:30) se borra el anterior de inicio Y el de fin.
-  - Al enviar mensaje de fin de sesión (:25/:55) NO se borra el anterior (se borrará al iniciar la próxima).
+MENSAJES:
+  - Al enviar mensaje de inicio de sesión se borra el anterior de inicio Y el de fin.
+  - Al enviar mensaje de fin de sesión NO se borra el anterior (se borrará al iniciar la próxima).
   - Al iniciar, se cargan los últimos 20 resultados de la API (primer mensaje WS)
     antes de pasar a modo real-time. Luego cada spin llega por evento en tiempo real.
 """
@@ -68,13 +69,11 @@ bot.session = _session
 
 # ─── RULETAS CONFIGURACIÓN ────────────────────────────────────────────────────
 ROULETTES = [
-    {"key": 223, "name": "ROULETTE ITALIA"},
-    {"key": 222, "name": "ROULETTE DEUTSCHE"},
-    {"key": 203, "name": "SPEED ROULETTE 1"},
-    {"key": 205, "name": "SPEED ROULETTE 2"},
-    {"key": 227, "name": "ROULETTE 1"},
-    {"key": 204, "name": "MEGA ROULETTE"},
+    {"key": 224, "name": "TURKISH ROULETTE"},
+    {"key": 221, "name": "RUSSIAN ROULETTE"},
     {"key": 206, "name": "ROULETTE MACAO"},
+    {"key": 201, "name": "ROULETTE 2"},
+    {"key": 225, "name": "AUTO ROULETTE"},
 ]
 
 # ─── LINKS POR RULETA ─────────────────────────────────────────────────────────
@@ -83,14 +82,15 @@ ROULETTE_LINKS = {
     "AUTO ROULETTE":          "https://1win.lat/casino/play/v_pragmatic:1winautoroulette",
     "ROULETTE ITALIA":        "https://1win.lat/casino/play/v_pragmatic:rouletteitaliatricolore",
     "ROULETTE 1":             "https://1win.lat/casino/play/v_pragmatic:roulette1",
-    "ROULETTE 2 EXTRA TIME":  "https://1win.lat/casino/play/v_pragmatic:roulette2",
+    "ROULETTE 3":             "https://1win.lat/casino/play/v_pragmatic:roulette3",
+    "ROULETTE 2":             "https://1win.lat/casino/play/v_pragmatic:roulette2",
     "SPEED ROULETTE 1":       "https://1win.lat/casino/play/v_pragmatic:speedroulette1",
     "SPEED ROULETTE 2":       "https://1win.lat/casino/play/v_pragmatic:speedroulette2",
     "ROULETTE MACAO":         "https://1win.lat/casino/play/v_pragmatic:roulettemacao",
     "ROULETTE LATINA":        "https://1win.lat/casino/play/v_pragmatic:1winspanishroulette",
     "ROULETTE DEUTSCHE":      "https://1win.lat/casino/play/v_pragmatic:germanroulette",
-    "ROULETTE TURKISH":       "https://1win.lat/casino/play/v_pragmatic:1winturkishroulette",
-    "ROULETTE RUSSIAN":       "https://1win.lat/casino/play/v_pragmatic:1winroulette",
+    "TURKISH ROULETTE":       "https://1win.lat/casino/play/v_pragmatic:1winturkishroulette",
+    "RUSSIAN ROULETTE":       "https://1win.lat/casino/play/v_pragmatic:1winroulette",
 }
 
 def get_roulette_url(name: str) -> Optional[str]:
@@ -120,12 +120,9 @@ def tg_send_with_button(text: str, roulette_name: str) -> Optional[int]:
 # ─── CONSTANTES ───────────────────────────────────────────────────────────────
 WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID      = "ppcjd00000007254"
-SESSION_ACTIVE = 25 * 60    # 25 min de señales activas
-SESSION_PAUSE  = 5  * 60    # 5 min de pausa entre sesiones
-SESSION_TOTAL  = SESSION_ACTIVE + SESSION_PAUSE   # 30 min = ciclo exacto por hora
-BASE_BET       = 0.50
+WIN_ROTATE_PAUSE = 5 * 60   # 5 min de espera tras WIN antes de cambiar ruleta
 WARMUP_SPINS   = 25
-MIN_PROB       = 0.78
+MIN_PROB       = 0.80
 TRAIN_INTERVAL = 100
 
 REAL_COLOR_MAP: dict = {
@@ -297,16 +294,9 @@ class GlobalStats:
         self.wins = 0; self.zeros = 0; self.losses = 0
         self.consecutive = 0
         self.last_20 = deque(maxlen=20)
-        self.signals_processed = 0
-
-    # Balance global acumulado (no por ruleta)
-    global_bankroll: float = 0.0
 
     def record(self, result_type: str, attempt: int, number: int,
-               val, type_str: str, roulette_name: str, profit_or_loss: float):
-        """profit_or_loss: positivo en WIN, negativo en LOSS, 0 en EMPATE."""
-        self.signals_processed += 1
-        self.global_bankroll = round(self.global_bankroll + profit_or_loss, 2)
+               val, type_str: str, roulette_name: str):
         if result_type == 'WIN':
             self.wins += 1; self.consecutive += 1
         elif result_type == 'LOSS':
@@ -316,30 +306,26 @@ class GlobalStats:
         self.last_20.append({
             "result": result_type, "attempt": attempt,
             "number": number, "val": val, "type": type_str,
-            "roulette": roulette_name, "balance": self.global_bankroll
+            "roulette": roulette_name,
         })
 
     def get_stats_text(self) -> str:
         total = self.wins + self.zeros + self.losses
         eff = ((self.wins + self.zeros) / total * 100) if total > 0 else 0.0
-        text  = "📊 RESUMEN DIARIO — TODAS LAS RULETAS 📊\n"
-        text += f"🕛 Reporte 12:00 hs (Argentina)\n\n"
-        text += f"► PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
-        text += f"► Consecutivas = {self.consecutive}\n"
-        text += f"► Assertividade = {eff:.2f}%\n"
-        text += f"► Balance total: 💰 {self.global_bankroll:.2f}\n"
-        text += f"► Total señales del día: {total}\n\n"
-        text += "📌 Últimas 20 SEÑALES 📌\n"
+        text  = "📆 MARCADOR DIARIO\n"
+        text += f"⚪ PLACAR = ✅{self.wins} | 🟠{self.zeros} | 🚫{self.losses}\n"
+        text += f"⚪ Consecutivas = {self.consecutive}\n"
+        text += f"⚪ Assertividade = {eff:.2f}%\n"
+        text += f"⚪ Total señales del día: {total}\n\n"
+        text += "📌 ÚLTIMAS 20 SEÑALES 📌\n"
         for s in reversed(list(self.last_20)):
-            a_str = f"🔄 GALE #{s['attempt']}"
-            b_str = f"💰 {s['balance']:.2f}"
-            rl    = s['roulette'][:14]
+            gale_str = f"🔄 GALE #{s['attempt'] - 1}"
             if s['result'] == 'WIN':
-                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
+                text += f"✅ WIN #{s['number']} {s['type']} {s['val']} | {gale_str}\n"
             elif s['result'] == 'EMPATE':
-                text += f"🟠 EMPATE #0 ZERO | {rl} | {a_str} | {b_str}\n"
+                text += f"🟠 EMPATE #0 ZERO | {gale_str}\n"
             else:
-                text += f"🚫 LOSS #{s['number']} {s['type']} {s['val']} | {rl} | {a_str} | {b_str}\n"
+                text += f"❌ LOSS #{s['number']} {s['type']} {s['val']} | {gale_str}\n"
         return text
 
 # Instancia global única de stats
@@ -371,9 +357,7 @@ class RouletteEngine:
         self.active_type = None
         self.active_pair: tuple = ()
         self.active_missing = ""
-        self.total_signal_loss = 0.0
         self.oportunidad = 1         # 1 = entrada base, 2 = gale x3
-        self.bankroll: float = 0.0
         self.active_signal_msg_id = None
         self.spins_since_train = 0
         self.last_game_id = None
@@ -461,18 +445,46 @@ class RouletteEngine:
         return {"pair": tuple(sorted(active)), "missing": missing, "prob": sum(counts[a] for a in active) / 5.0}
 
     def _get_ph(self, cat_type: str) -> Optional[Dict]:
+        """Estadísticas históricas ponderadas exponencialmente.
+        Los eventos más recientes tienen mayor peso (decay=0.97 por posición).
+        """
         if not self.spin_history: return None
         last_num = self.spin_history[-1]["number"]
         if last_num == 0: return None
-        counts = self.after_number_dozen.get(last_num, {}) if cat_type == "DOCENA" else \
-                 self.after_number_column.get(last_num, {})
-        total = sum(counts.values())
-        if total < 10: return None
-        sc = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+
+        # ── Reconstruir conteos ponderados desde spin_history ─────────────────
+        # Recorremos la historia buscando ocurrencias de last_num y ponderando
+        # el siguiente número según su antigüedad (posición más reciente = peso 1.0)
+        DECAY = 0.97
+        weighted: dict = {1: 0.0, 2: 0.0, 3: 0.0}
+        total_weight = 0.0
+        history = self.spin_history
+
+        # Encontrar pares (last_num → siguiente) en orden cronológico inverso
+        pairs_found = 0
+        for i in range(len(history) - 2, -1, -1):
+            if history[i]["number"] == last_num and history[i + 1]["number"] != 0:
+                nxt = history[i + 1]["number"]
+                val = (get_dozen(nxt) if cat_type == "DOCENA" else get_column(nxt))
+                if val in weighted:
+                    w = DECAY ** pairs_found
+                    weighted[val] += w
+                    total_weight  += w
+                    pairs_found   += 1
+
+        if total_weight < 5.0 or pairs_found < 5:
+            return None
+
+        # Normalizar
+        probs = {k: v / total_weight for k, v in weighted.items()}
+        sc = sorted(probs.items(), key=lambda x: x[1], reverse=True)
         if len(sc) < 2: return None
         missing = list({1, 2, 3} - {sc[0][0], sc[1][0]})[0]
-        return {"pair": tuple(sorted([sc[0][0], sc[1][0]])), "missing": missing,
-                "prob": (sc[0][1] + sc[1][1]) / total}
+        return {
+            "pair": tuple(sorted([sc[0][0], sc[1][0]])),
+            "missing": missing,
+            "prob": sc[0][1] + sc[1][1],
+        }
 
     def _predict_pair_ml(self, cat_type: str, missing_num: int) -> float:
         mk   = self.markov_d if cat_type == "DOCENA" else self.markov_c
@@ -523,17 +535,12 @@ class RouletteEngine:
     def _build_signal_text(self) -> str:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
-        type_str, singular = ("docenas", "docena") if self.active_type == "DOCENA" else ("columnas", "columna")
+        type_str  = ("docenas" if self.active_type == "DOCENA" else "columnas")
         gale_num  = self.oportunidad - 1   # 0 = entrada base, 1 = gale
-        bet       = BASE_BET if gale_num == 0 else BASE_BET * 3
-        total_bet = bet * 2
         return (
             f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
             f"🕹️ {self.name}\n"
             f"🎯 Entrar en las {type_str}: {pair_disp}\n"
-            f"💰 Balance: {GLOBAL_STATS.global_bankroll:.2f}\n"
-            f"💵 Apuesta total: {total_bet:.2f}\n"
-            f"🚨 (por {singular}: {bet:.2f})\n"
             f"⚔️ Cubrir el CERO 🟢\n"
             f"🛟 GALE #{gale_num}"
         )
@@ -549,28 +556,23 @@ class RouletteEngine:
         self.active_pair      = sig["pair"]
         self.active_missing   = sig["missing"]
         self.oportunidad      = 1
-        self.total_signal_loss = 0.0
         self.send_signal()
 
     def resolve(self, number: int) -> bool:
         """Resolver resultado. Retorna True si la señal terminó."""
-        color    = REAL_COLOR_MAP.get(number, "VERDE")
         d, c     = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
         intento  = self.oportunidad   # 1 o 2
-        bet      = BASE_BET if intento == 1 else BASE_BET * 3
-
-        gale_num = intento - 1  # 0 = entrada base, 1 = gale
+        gale_num = intento - 1        # 0 = entrada base, 1 = gale
 
         # ── CERO ──────────────────────────────────────────────────────────────
         if number == 0:
             tg_send(
                 f"🟠 EMPATE 0 — ZERO — 🔄 GALE #{gale_num}\n"
-                f"🉑 Para la próxima ganaremos 0.00 🉑\n"
-                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
+                f"🉑 Para la próxima ganaremos 🉑"
             )
-            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name, 0.0)
+            GLOBAL_STATS.record('EMPATE', intento, 0, 0, type_str, self.name)
             self._reset_signal()
             return True
 
@@ -578,41 +580,32 @@ class RouletteEngine:
               (type_str == "COLUMNA" and c != 0 and f"C{c}" in self.active_pair)
 
         if won:
-            profit = bet
-            self.bankroll = round(self.bankroll + profit, 2)
             cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name, profit)
+            GLOBAL_STATS.record('WIN', intento, number, val_num, type_str, self.name)
             tg_send(
                 f"✅ WIN {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                f"🎉 Felicidades has ganado {profit:.2f} 🎉\n"
-                f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
+                f"🎉 Felicidades has ganado 🎉"
             )
             self._reset_signal()
             return True
 
         else:
-            loss = bet * 2
-            self.bankroll          = round(self.bankroll - loss, 2)
-            self.total_signal_loss = round(self.total_signal_loss + loss, 2)
-
             if intento == 1:
-                # ── Perdió Gale #0 → borrar mensaje de señal, enviar GALE #1 ──
-                # El próximo giro valida Gale #1 directamente (NO se salta)
+                # Perdió Gale #0 → borrar señal, reenviar con GALE #1
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                self.oportunidad    = 2
-                self.send_signal()   # nuevo mensaje con GALE #1
-                return False         # señal sigue activa
+                self.oportunidad = 2
+                self.send_signal()
+                return False   # señal sigue activa
 
             else:
-                # ── Perdió Gale #1 → mensaje con LOSS ──────────────────────
+                # Perdió Gale #1 → LOSS
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name, -self.total_signal_loss)
+                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name)
                 tg_send(
                     f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}\n"
-                    f"🚨 Señal perdida. Monto total perdido en las 2 entradas: -{self.total_signal_loss:.2f} 🚨\n"
-                    f"💰 Balance actual: {GLOBAL_STATS.global_bankroll:.2f}"
+                    f"🚨 Señal perdida 🚨"
                 )
                 self._reset_signal()
                 return True
@@ -621,7 +614,6 @@ class RouletteEngine:
         self.signal_active = False
         self.active_pair = ()
         self.active_type = None
-        self.total_signal_loss = 0.0
         self.oportunidad = 1
         self.active_signal_msg_id = None
 
@@ -653,94 +645,64 @@ class RouletteEngine:
 # ─── GESTOR DE SESIONES ───────────────────────────────────────────────────────
 class SessionManager:
     """
-    Sesiones sincronizadas al reloj:
-      - Arrancan en HH:00 y HH:30 exactos (hora Argentina UTC-3)
-      - 25 min activos (señales) + 5 min de pausa → 48 sesiones/día
-      - 5 ruletas rotando en orden. Al terminar la 5ª vuelve a la 1ª.
-      - Solo la ruleta activa puede emitir señal; las demás acumulan datos.
+    Rotación por señal ganada:
+      - Sin sesiones de tiempo fijo. La ruleta activa permanece hasta emitir 1 señal.
+      - Al ganar (WIN) una señal, se espera WIN_ROTATE_PAUSE (5 min) y se rota a la siguiente.
+      - En LOSS o EMPATE la sesión continúa en la misma ruleta (sin señal activa).
+      - Solo la ruleta activa puede emitir señal; las demás acumulan datos en modo pasivo.
 
     MENSAJES:
-      - Al enviar mensaje de inicio (:00/:30) se elimina el anterior de inicio Y el de fin.
-      - Al enviar mensaje de fin (:25/:55) solo se guarda el ID (se borrará al iniciar la próxima).
+      - Al iniciar sesión se elimina el mensaje de inicio anterior Y el de fin anterior.
+      - Al enviar mensaje de fin solo se guarda el ID (se borrará al iniciar la próxima).
     """
-    ARG_UTC_OFFSET = -3
 
     def __init__(self):
         self.engines: list[RouletteEngine] = [
             RouletteEngine(r["key"], r["name"]) for r in ROULETTES
         ]
-        self.current_idx       = 0
-        self.session_start     = 0.0      # epoch del inicio del slot actual
-        self.session_active    = False    # True durante los 25 min activos
+        self.current_idx            = 0
+        self.session_start          = time.time()
+        self.session_active         = True
         self.signal_sent_this_session = False
+        self.pending_rotation       = False   # True durante los 5 min de espera tras WIN
+        self.rotation_start_time    = 0.0     # epoch de cuando empieza la espera
 
         # ── IDs para borrar mensajes anteriores ───────────────────────────────
-        self.prev_start_msg_id: Optional[int] = None   # msg de :00/:30 anterior
-        self.prev_end_msg_id:   Optional[int] = None   # msg de :25/:55 anterior
+        self.prev_start_msg_id: Optional[int] = None
+        self.prev_end_msg_id:   Optional[int] = None
 
-        logger.info("[SessionManager] Iniciado — esperando próximo slot en punto o media hora.")
+        logger.info("[SessionManager] Iniciado — rotación por señal ganada / 5 min de pausa post-WIN.")
+        self._send_start_message()
 
     # ── Hora Argentina ────────────────────────────────────────────────────────
     def _now_arg(self):
         import datetime
-        return datetime.datetime.utcnow() + datetime.timedelta(hours=self.ARG_UTC_OFFSET)
+        return datetime.datetime.utcnow() + datetime.timedelta(hours=-3)
 
-    # ── Calcular cuántos segundos faltan para el próximo slot (HH:00 o HH:30) ─
-    def seconds_to_next_slot(self) -> float:
-        import datetime
-        now = self._now_arg()
-        if now.second <= 5 and now.minute in (0, 30):
-            return 0.0
-        if now.minute < 30:
-            target = now.replace(minute=30, second=0, microsecond=0)
-        else:
-            target = (now + datetime.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        diff = (target - now).total_seconds()
-        return max(0.0, diff)
-
-    # ── Calcular el índice de ruleta según el slot del día ───────────────────
-    def _slot_index_for_now(self) -> int:
-        now = self._now_arg()
-        slot_of_day = now.hour * 2 + (1 if now.minute >= 30 else 0)
-        return slot_of_day % len(self.engines)
-
-    # ── Iniciar sesión activa ─────────────────────────────────────────────────
-    def _start_session(self, initial: bool = False):
-        import datetime
-        # En el arranque inicial se calcula el índice desde el reloj.
-        # En todos los cambios siguientes se avanza secuencialmente para que
-        # la ruleta que sigue sea siempre la inmediata posterior en el array,
-        # sin importar la hora — así se evita el desfase de _slot_index_for_now().
-        if initial:
-            self.current_idx = self._slot_index_for_now()
-        else:
-            self.current_idx = (self.current_idx + 1) % len(self.engines)
-
-        self.session_start = time.time()
-        self.session_active = True
-        self.signal_sent_this_session = False
+    # ── Enviar mensaje de inicio de sesión ────────────────────────────────────
+    def _send_start_message(self):
         engine = self.engines[self.current_idx]
-        now_str = self._now_arg().strftime("%H:%M")
-        end_str = (self._now_arg() + datetime.timedelta(minutes=25)).strftime("%H:%M")
-        logger.info(f"[SessionManager] 🟢 Sesión iniciada: {engine.name} | {now_str}–{end_str} (ARG)")
-
+        # Borrar inicio anterior + fin anterior
         if self.prev_start_msg_id:
             tg_delete(CHAT_ID, self.prev_start_msg_id)
             self.prev_start_msg_id = None
-
+        if self.prev_end_msg_id:
+            tg_delete(CHAT_ID, self.prev_end_msg_id)
+            self.prev_end_msg_id = None
         msg_id = tg_send(f"🔔 SESION INICIADA — {engine.name} 🔔")
         self.prev_start_msg_id = msg_id
+        logger.info(f"[SessionManager] 🟢 Sesión activa: {engine.name}")
 
-    # ── Cerrar sesión activa ──────────────────────────────────────────────────
-    def _end_session(self):
-        engine = self.engines[self.current_idx]
-        # El next_idx es siempre el siguiente en el array — igual que hará _start_session
-        next_idx  = (self.current_idx + 1) % len(self.engines)
-        next_name = self.engines[next_idx].name
-        logger.info(f"[SessionManager] ⏸ Sesión terminada: {engine.name} → siguiente: {next_name}")
-        self.session_active = False
+    # ── Rotar a siguiente ruleta ──────────────────────────────────────────────
+    def _rotate_to_next(self):
+        """Cierra la sesión actual y pasa a la siguiente ruleta."""
+        engine     = self.engines[self.current_idx]
+        next_idx   = (self.current_idx + 1) % len(self.engines)
+        next_name  = self.engines[next_idx].name
 
-        # ── Al enviar nuevo fin: borrar el mensaje de fin ANTERIOR ────────────
+        logger.info(f"[SessionManager] 🔄 Rotando: {engine.name} → {next_name}")
+
+        # Borrar fin anterior
         if self.prev_end_msg_id:
             tg_delete(CHAT_ID, self.prev_end_msg_id)
             self.prev_end_msg_id = None
@@ -748,89 +710,63 @@ class SessionManager:
         text = (
             f"⏸ SESIÓN CERRADA — {engine.name}\n"
             f"🎰 PRÓXIMA RULETA — {next_name} 🎰\n\n"
-            f"💵 ¿COMO OPERAR LAS SEÑALES?\n\n"
-            f"1° Op. = $0.50 USD x Docena/Columna\n"
-            f"2° Op. = $1.50 USD x Docena/Columna\n\n"
             f"🎯 FUNCIONAMIENTO DE LAS SEÑALES 🎯\n\n"
             f"  • Se envía señal → Se resuelve\n"
-            f"  • Sesión se cierra → Ej: 12:25 o 12:55\n"
-            f"  • Nueva Sesión → Ej: 15:00 o 15:30\n"
-            f"  • Nueva Señal → Ciclo de señales\n\n"
-            f"♦️ POR SESION SE ENVÍA 1 SEÑAL ♦️"
+            f"  • Al ganar → Rotamos de ruleta (5 min de pausa)\n"
+            f"  • Nueva Ruleta → Nueva Señal\n\n"
+            f"♦️ POR SESIÓN SE ENVÍA 1 SEÑAL ♦️"
         )
         msg_id = tg_send_with_button(text, next_name)
         self.prev_end_msg_id = msg_id
 
-    # ── Watchdog: controla inicio/fin de sesión según el reloj ───────────────
+        self.current_idx              = next_idx
+        self.session_start            = time.time()
+        self.session_active           = True
+        self.signal_sent_this_session = False
+        self._send_start_message()
+
+    # ── WIN detectado: iniciar espera de 5 min antes de rotar ────────────────
+    def _on_win(self):
+        """Llamado justo después de resolver un WIN. Inicia la pausa de 5 min."""
+        self.pending_rotation    = True
+        self.rotation_start_time = time.time()
+        remaining_min = WIN_ROTATE_PAUSE // 60
+        engine = self.engines[self.current_idx]
+        logger.info(
+            f"[SessionManager] ✅ WIN en {engine.name} — "
+            f"esperando {remaining_min} min antes de rotar."
+        )
+        tg_send(
+            f"⏳ Rotando ruleta en <b>{remaining_min} minutos</b>...\n"
+            f"🎰 Próxima: <b>{self.engines[(self.current_idx + 1) % len(self.engines)].name}</b>"
+        )
+
+    # ── Watchdog: solo vigila la rotación post-WIN ────────────────────────────
     async def session_watchdog(self):
-        # Esperar al primer slot
-        wait = self.seconds_to_next_slot()
-        logger.info(f"[SessionManager] ⏳ Esperando {wait/60:.1f} min para el primer slot...")
-        await asyncio.sleep(wait)
-        self._start_session(initial=True)   # ← arranque inicial: usar el reloj
-
-        _waiting_signal_since: Optional[float] = None
-        SIGNAL_WAIT_TIMEOUT = 120
-
         while True:
             await asyncio.sleep(1)
-            now     = time.time()
-            elapsed = now - self.session_start
-            engine  = self.engines[self.current_idx]
-
-            if self.session_active:
-                if elapsed >= SESSION_ACTIVE:
-                    if engine.signal_active:
-                        if _waiting_signal_since is None:
-                            _waiting_signal_since = now
-                            logger.info(
-                                f"[SessionManager] ⏳ Sesión terminada pero señal activa en "
-                                f"{engine.name} — esperando resolución (máx {SIGNAL_WAIT_TIMEOUT}s)..."
-                            )
-                        elif now - _waiting_signal_since >= SIGNAL_WAIT_TIMEOUT:
-                            logger.warning(
-                                f"[SessionManager] ⚠️ Timeout esperando señal en {engine.name} "
-                                f"({SIGNAL_WAIT_TIMEOUT}s). Cancelando señal y cerrando sesión."
-                            )
-                            if engine.active_signal_msg_id:
-                                tg_edit(CHAT_ID, engine.active_signal_msg_id,
-                                        engine._build_signal_text() +
-                                        "\n\n⚠️ Señal cancelada — tiempo de sesión agotado.")
-                            engine._reset_signal()
-                            _waiting_signal_since = None
-                        else:
-                            continue
-                    else:
-                        _waiting_signal_since = None
-
-                    end_time = time.time()
-                    self._end_session()
-                    pause_remaining = SESSION_TOTAL - (end_time - self.session_start)
-                    if pause_remaining > 0:
-                        logger.info(f"[SessionManager] ⏸ Pausa {pause_remaining:.0f}s")
-                        await asyncio.sleep(pause_remaining)
-                    self._start_session()   # ← rotación normal: avanza +1
-            else:
-                if elapsed >= SESSION_TOTAL:
-                    self._start_session()   # ← rotación normal: avanza +1
+            if self.pending_rotation:
+                elapsed = time.time() - self.rotation_start_time
+                if elapsed >= WIN_ROTATE_PAUSE:
+                    self.pending_rotation = False
+                    self._rotate_to_next()
 
     # ── Tick de sesión activa ─────────────────────────────────────────────────
     def tick_active(self, engine: RouletteEngine, number: int):
         engine.feed_number(number, active=True)
 
-        if not self.session_active:
-            return
-
-        elapsed = time.time() - self.session_start
-        if elapsed >= SESSION_ACTIVE:
+        if not self.session_active or self.pending_rotation:
             return
 
         if engine.signal_active:
             done = engine.resolve(number)
             if done:
-                elapsed2 = time.time() - self.session_start
-                if elapsed2 >= SESSION_ACTIVE:
-                    self._end_session()
+                # Verificar si fue WIN (la señal se resolvió satisfactoriamente)
+                # resolve() ya registró el resultado en GLOBAL_STATS;
+                # detectamos WIN por el último registro
+                last = list(GLOBAL_STATS.last_20)[-1] if GLOBAL_STATS.last_20 else None
+                if last and last.get("result") == "WIN":
+                    self._on_win()
             return
 
         if not self.signal_sent_this_session and engine.warmup_done:
@@ -857,11 +793,9 @@ class SessionManager:
 
     # ── Avanzar ruleta manualmente (comando /siguiente) ───────────────────────
     def _advance_session(self):
-        self._end_session()
-        self.current_idx = (self.current_idx + 1) % len(self.engines)
-        self.session_start = time.time()
-        self.session_active = True
-        self.signal_sent_this_session = False
+        self.pending_rotation = False
+        self._rotate_to_next()
+
 
 
 # ─── WS READER POR RULETA ─────────────────────────────────────────────────────
@@ -1036,16 +970,18 @@ def health():
         return jsonify({"status": "initializing"})
     active = session_mgr_global.engines[session_mgr_global.current_idx]
     elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed)
+    pending = session_mgr_global.pending_rotation
+    rotation_in = max(0, int(WIN_ROTATE_PAUSE - (time.time() - session_mgr_global.rotation_start_time))) \
+                  if pending else None
     return jsonify({
         "active_roulette": active.name,
         "session_elapsed_s": elapsed,
-        "session_remaining_s": remaining,
         "signal_sent": session_mgr_global.signal_sent_this_session,
         "signal_active": active.signal_active,
+        "pending_rotation": pending,
+        "rotation_in_s": rotation_in,
         "engines": [
-            {"name": e.name, "spins": len(e.spin_history), "warmup": e.warmup_done,
-             "balance": e.bankroll}
+            {"name": e.name, "spins": len(e.spin_history), "warmup": e.warmup_done}
             for e in session_mgr_global.engines
         ]
     })
@@ -1081,8 +1017,8 @@ async def daily_stats_loop():
 def cmd_start(m):
     bot.reply_to(m,
         "<b>🎰 Multi-Roulette Session Bot</b>\n\n"
-        "5 ruletas rotando cada 30 min\n"
-        "1 señal por sesión | 48 señales/día\n"
+        "5 ruletas — rotación automática tras WIN\n"
+        "5 min de pausa entre ruletas\n"
         "📊 Stats unificadas enviadas a las 12:00 hs (ARG)\n\n"
         "/status — Estado actual\n"
         "/stats — Ver estadísticas ahora\n"
@@ -1093,15 +1029,20 @@ def cmd_start(m):
 def cmd_status(m):
     if not session_mgr_global: return
     active = session_mgr_global.engines[session_mgr_global.current_idx]
-    elapsed = int(time.time() - session_mgr_global.session_start)
-    remaining = max(0, SESSION_ACTIVE - elapsed) // 60
-    st = f"🟢 Señal activa: {active.active_pair}" if active.signal_active else "⚪ Esperando señal"
+    elapsed = int(time.time() - session_mgr_global.session_start) // 60
+    pending = session_mgr_global.pending_rotation
+    if pending:
+        rot_in = max(0, int(WIN_ROTATE_PAUSE - (time.time() - session_mgr_global.rotation_start_time)))
+        st = f"⏳ Rotando en {rot_in}s → {session_mgr_global.engines[(session_mgr_global.current_idx+1)%len(session_mgr_global.engines)].name}"
+    elif active.signal_active:
+        st = f"🟢 Señal activa: {active.active_pair}"
+    else:
+        st = "⚪ Esperando señal"
     bot.reply_to(m,
         f"<b>Ruleta activa:</b> {active.name}\n"
         f"<b>Estado:</b> {st}\n"
-        f"<b>Tiempo restante:</b> {remaining} min\n"
-        f"<b>Señal enviada:</b> {'✅' if session_mgr_global.signal_sent_this_session else '⏳'}\n"
-        f"<b>Balance global:</b> {GLOBAL_STATS.global_bankroll:.2f}",
+        f"<b>Tiempo en esta ruleta:</b> {elapsed} min\n"
+        f"<b>Señal enviada:</b> {'✅' if session_mgr_global.signal_sent_this_session else '⏳'}",
         parse_mode="HTML")
 
 @bot.message_handler(commands=['stats'])
@@ -1137,7 +1078,7 @@ async def main():
         tasks.append(asyncio.create_task(ws_reader(r["key"], session_mgr_global)))
     tasks.append(asyncio.create_task(self_ping_loop()))
 
-    logger.info("[Main] 🎰 Multi-Roulette Session Bot iniciado — 5 ruletas / 30 min por sesión")
+    logger.info("[Main] 🎰 Multi-Roulette Session Bot iniciado — 5 ruletas / rotación por WIN / 5 min pausa")
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
