@@ -11,18 +11,17 @@ Ruletas:
 
 Lógica:
   - Sesiones VIP en horarios fijos (hora Argentina):
-      05:00–07:00 | 09:00–11:00 | 13:00–15:00 | 17:00–19:00 | 21:00–23:00
-  - Cada sesión usa una ruleta diferente (rotación secuencial).
+      01:00–03:00 | 05:00–07:00 | 09:00–11:00 | 13:00–15:00 | 17:00–19:00 | 21:00–23:00
+  - Cada sesión usa una ruleta diferente (rotación secuencial, 5 ruletas para 6 sesiones).
   - Fuera de sesión: solo acumula datos, no emite señales.
   - ALERTA DE OPORTUNIDAD: si los últimos 4 giros pertenecen a solo 2 docenas/columnas,
     se envía aviso. En el giro 5 se evalúa si hay señal; si no, se cancela.
-  - Apuesta: 0.50 por categoría (total 1.00). En gale x3 → 1.50 c/u (total 3.00). Solo 1 gale.
+  - Apuesta: 0.50 por categoría (total 1.00). Hasta 2 gales x3 → 1.50 c/u (total 3.00) cada uno. 3 intentos en total.
   - Stats del día enviadas a las 00:00 ARG. Stats globales también a las 00:00.
   - Estadísticas históricas ponderadas exponencialmente (más peso a los datos recientes).
 
 MENSAJES:
-  - Al enviar mensaje de inicio de sesión se borra el anterior de inicio Y el de fin.
-  - Al enviar mensaje de fin de sesión NO se borra el anterior (se borrará al iniciar la próxima).
+  - Los mensajes de inicio VIP de sesión y finalización NO se eliminan del chat.
   - Al iniciar, se cargan los últimos 20 resultados de la API (primer mensaje WS)
     antes de pasar a modo real-time. Luego cada spin llega por evento en tiempo real.
 """
@@ -116,14 +115,15 @@ WS_URL         = "wss://dga.pragmaticplaylive.net/ws"
 CASINO_ID      = "ppcjd00000007254"
 # Sesiones VIP: (hora_inicio, hora_fin) en hora Argentina
 VIP_SESSIONS = [
+    (1, 3),
     (5, 7),
     (9, 11),
     (13, 15),
     (17, 19),
     (21, 23),
 ]
-WARMUP_SPINS   = 25
-MIN_PROB       = 0.78
+WARMUP_SPINS   = 300
+MIN_PROB       = 0.80
 TRAIN_INTERVAL = 100
 
 REAL_COLOR_MAP: dict = {
@@ -567,7 +567,7 @@ class RouletteEngine:
         nums = sorted([p[1:] for p in self.active_pair])
         pair_disp = f"{nums[0]} y {nums[1]}"
         type_str  = ("docenas" if self.active_type == "DOCENA" else "columnas")
-        gale_num  = self.oportunidad - 1   # 0 = entrada base, 1 = gale
+        gale_num  = self.oportunidad - 1   # 0 = entrada base, 1 = gale 1, 2 = gale 2
         return (
             f"✅✅ ENTRADA CONFIRMADA ✅✅\n\n"
             f"🕹️ {self.name}\n"
@@ -594,8 +594,8 @@ class RouletteEngine:
         d, c     = get_dozen(number), get_column(number)
         type_str = self.active_type
         val_num  = d if type_str == "DOCENA" else c
-        intento  = self.oportunidad   # 1 o 2
-        gale_num = intento - 1        # 0 = entrada base, 1 = gale
+        intento  = self.oportunidad   # 1, 2 o 3
+        gale_num = intento - 1        # 0 = entrada base, 1 = gale 1, 2 = gale 2
 
         # ── CERO ──────────────────────────────────────────────────────────────
         if number == 0:
@@ -615,19 +615,19 @@ class RouletteEngine:
             return True
 
         else:
-            if intento == 1:
-                # Perdió Gale #0 → borrar señal, reenviar con GALE #1
+            if intento < 3:
+                # Perdió este intento → borrar señal, reenviar con el siguiente GALE
                 if self.active_signal_msg_id:
                     tg_delete(CHAT_ID, self.active_signal_msg_id)
                     self.active_signal_msg_id = None
-                self.oportunidad = 2
+                self.oportunidad = intento + 1
                 self.send_signal()
                 return False   # señal sigue activa
 
             else:
-                # Perdió Gale #1 → LOSS
+                # Perdió Gale #2 (3er intento) → LOSS
                 cat_label = f"{'DOCENA' if type_str == 'DOCENA' else 'COLUMNA'} {val_num}"
-                GLOBAL_STATS.record('LOSS', 2, number, val_num, type_str, self.name)
+                GLOBAL_STATS.record('LOSS', 3, number, val_num, type_str, self.name)
                 tg_send(f"❌ LOSS {number} — {cat_label} — 🔄 GALE #{gale_num}")
                 self._reset_signal()
                 return True
@@ -697,12 +697,17 @@ class RouletteEngine:
 class SessionManager:
     """
     Sesiones VIP en horarios fijos (hora Argentina):
-      05:00–07:00 | 09:00–11:00 | 13:00–15:00 | 17:00–19:00 | 21:00–23:00
+      01:00–03:00 | 05:00–07:00 | 09:00–11:00 | 13:00–15:00 | 17:00–19:00 | 21:00–23:00
 
     - Cada sesión usa una ruleta diferente (rotación secuencial por sesión).
+      Son 6 sesiones y 5 ruletas → la ruleta se repite cada 5 sesiones (módulo 5).
     - Fuera de sesión: solo acumula datos, no emite señales ni alertas.
     - ALERTA DE OPORTUNIDAD: si últimos 4 giros son de 2 docenas/columnas, avisa.
       En el giro 5 evalúa si hay señal; si no, cancela la alerta.
+    - Aviso PRE-SESIÓN: 15 minutos antes de cada sesión, se envía un mensaje
+      anunciando la ruleta que se usará.
+    - Aviso POST-SESIÓN: 10 minutos después de terminar cada sesión, se envía
+      un mensaje con el cronograma completo de sesiones del día.
     """
 
     def __init__(self):
@@ -717,6 +722,10 @@ class SessionManager:
         self.prev_start_msg_id: Optional[int] = None
         self.prev_end_msg_id:   Optional[int] = None
 
+        # ── Control de avisos pre/post sesión (evitar reenvíos duplicados) ────
+        self._preavviso_sent_for: Optional[tuple] = None   # (idx_sesión, fecha) ya avisada
+        self._postaviso_sent_for: Optional[tuple] = None   # (idx_sesión, fecha) ya avisada
+
         logger.info("[SessionManager] Iniciado — sesiones VIP por horario.")
 
     # ── Hora Argentina ────────────────────────────────────────────────────────
@@ -728,7 +737,6 @@ class SessionManager:
     # ── ¿Estamos dentro de una sesión VIP? ───────────────────────────────────
     @staticmethod
     def _in_vip_session() -> bool:
-        import datetime
         now = SessionManager._now_arg()
         h = now.hour
         for (start_h, end_h) in VIP_SESSIONS:
@@ -736,15 +744,24 @@ class SessionManager:
                 return True
         return False
 
+    # ── Próxima sesión (índice de VIP_SESSIONS y datetime de inicio) ─────────
+    @staticmethod
+    def _next_session_start():
+        import datetime
+        now = SessionManager._now_arg()
+        today = now.date()
+        candidates = []
+        for i, (start_h, _) in enumerate(VIP_SESSIONS):
+            start_dt = datetime.datetime(today.year, today.month, today.day, start_h, 0, 0)
+            if start_dt <= now:
+                start_dt += datetime.timedelta(days=1)
+            candidates.append((i, start_dt))
+        return min(candidates, key=lambda x: x[1])
+
     # ── Enviar mensaje de inicio de sesión ────────────────────────────────────
     def _send_start_message(self):
         engine = self.engines[self.current_idx]
-        if self.prev_start_msg_id:
-            tg_delete(CHAT_ID, self.prev_start_msg_id)
-            self.prev_start_msg_id = None
-        if self.prev_end_msg_id:
-            tg_delete(CHAT_ID, self.prev_end_msg_id)
-            self.prev_end_msg_id = None
+        # Los mensajes de inicio y fin VIP NO se eliminan del chat (quedan como registro)
         msg_id = tg_send("⭐️ ¡Sesión VIP iniciada! ⭐️")
         self.prev_start_msg_id = msg_id
         logger.info(f"[SessionManager] 🟢 Sesión VIP iniciada: {engine.name}")
@@ -758,12 +775,67 @@ class SessionManager:
         # Avanzar índice para la próxima sesión
         self.current_idx = (self.current_idx + 1) % len(self.engines)
 
-    # ── Watchdog: vigila inicio/fin de sesión VIP ────────────────────────────
+    # ── Enviar aviso 15 min antes de iniciar sesión ───────────────────────────
+    def _send_pre_session_message(self, roulette_name: str):
+        text = (
+            "EN BREVE COMENZAMOS NUESTRA\n"
+            "SESIÓN GRATUITA EN 15 MINUTOS 💪\n\n"
+            "🟥 Antes de comenzar 🟥\n\n"
+            "Para aprovechar mejor la sesión, recomendamos un capital inicial de(5 USD)\n\n"
+            "Este monto te permite operar con mayor control, mejor gestión\n"
+            "y aprovechar las oportunidades con más tranquilidad. 📈\n\n"
+            f"⚪ USAREMOS {roulette_name} ⚪"
+        )
+        tg_send(text)
+        logger.info(f"[SessionManager] 🔔 Aviso pre-sesión enviado (15 min antes) — {roulette_name}")
+
+    # ── Enviar aviso 10 min después de finalizar sesión ──────────────────────
+    def _send_post_session_message(self):
+        text = (
+            "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥 \n\n"
+            "▶️ SESIONES EN EL DIA\n\n"
+            "📍S1 — 1:00 HASTA 3:00\n"
+            "📍S2 — 5:00 HASTA 7:00\n"
+            "📍S3 — 9:00 HASTA 11:00\n"
+            "📍S4 — 13:00 HASTA 15:00\n"
+            "📍S5 — 17:00 HASTA 19:00 \n"
+            "📍S6 — 21:00 HASTA 23:00\n\n"
+            "⚠️IMPORTANTE: Estos horarios son basados en el horario de Argentina 🇦🇷\n\n"
+            "Consulta tu horario en tu país…\n"
+            "DUDAS? Habla conmigo @PinguiRoulette 🚀\n\n"
+            "🔞 Juega con Responsabilidad"
+        )
+        tg_send(text)
+        logger.info("[SessionManager] 📋 Aviso post-sesión enviado (10 min después)")
+
+    # ── Watchdog: vigila inicio/fin de sesión VIP + avisos pre/post ──────────
     async def session_watchdog(self):
+        import datetime
         was_in_session = False
+        last_session_end: Optional[datetime.datetime] = None  # datetime en que terminó la última sesión
+
         while True:
             await asyncio.sleep(10)
+            now = self._now_arg()
             in_session = self._in_vip_session()
+
+            # ── Aviso PRE-SESIÓN: 15 min antes de la próxima sesión ──────────
+            if not in_session:
+                next_idx, next_start = self._next_session_start()
+                minutes_to_start = (next_start - now).total_seconds() / 60.0
+                key = (next_idx, next_start.date(), next_start.hour)
+                if 0 <= minutes_to_start <= 15 and self._preavviso_sent_for != key:
+                    roulette_name = self.engines[next_idx].name
+                    self._send_pre_session_message(roulette_name)
+                    self._preavviso_sent_for = key
+
+            # ── Aviso POST-SESIÓN: 10 min después de terminar ────────────────
+            if last_session_end is not None:
+                minutes_since_end = (now - last_session_end).total_seconds() / 60.0
+                key = (last_session_end.date(), last_session_end.hour, last_session_end.minute)
+                if minutes_since_end >= 10 and self._postaviso_sent_for != key:
+                    self._send_post_session_message()
+                    self._postaviso_sent_for = key
 
             if in_session and not was_in_session:
                 # Entrar a sesión VIP
@@ -780,6 +852,7 @@ class SessionManager:
                 engine = self.engines[self.current_idx]
                 engine._reset_signal()
                 self._send_end_message()
+                last_session_end = now
                 was_in_session = False
 
     # ── Tick de sesión activa ─────────────────────────────────────────────────
@@ -796,8 +869,8 @@ class SessionManager:
                 self.signal_sent_this_session = True
             return
 
-        # ── Solo 1 señal por sesión ───────────────────────────────────────────
-        if self.signal_sent_this_session or not engine.warmup_done:
+        # ── Sin límite de señales mientras la sesión esté activa ──────────────
+        if not engine.warmup_done:
             return
 
         # ── Alerta de oportunidad activa → evaluar en cada giro ──────────────
@@ -1085,8 +1158,8 @@ async def daily_stats_loop():
 def cmd_start(m):
     bot.reply_to(m,
         "<b>🎰 Multi-Roulette Session Bot — Sesiones VIP</b>\n\n"
-        "Sesiones: 5-7 | 9-11 | 13-15 | 17-19 | 21-23 (ARG)\n"
-        "Cada sesión → una ruleta diferente\n"
+        "Sesiones: 1-3 | 5-7 | 9-11 | 13-15 | 17-19 | 21-23 (ARG)\n"
+        "Cada sesión → una ruleta diferente (5 ruletas, 6 sesiones)\n"
         "📊 Stats enviadas a las 00:00 hs (ARG)\n\n"
         "/status — Estado actual\n"
         "/stats — Ver estadísticas ahora\n"
